@@ -12,6 +12,7 @@ use std::{
     ops::Range as StdRange,
     os::fd::AsRawFd,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender, TryRecvError},
@@ -27,12 +28,12 @@ use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
-    render::{CellIterator, CursorVisualStyle, RenderState, RowIterator},
-    screen::{CellContentTag, CellWide},
-    selection::{
-        FormatOptions, SelectLineOptions, SelectWordOptions, Selection as GhosttySelection,
+    render::{
+        CellIterator, CursorVisualStyle, Dirty, RenderState, RowId, RowIteration, RowIterator,
     },
-    style::{StyleColor, Underline},
+    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
+    selection::{FormatOptions, Selection as GhosttySelection},
+    style::{Palette, RgbColor, StyleColor, Underline},
     terminal::{
         ClipboardWriteError, ConformanceLevel, CursorStyle, DeviceAttributeFeature,
         DeviceAttributes, DeviceType, Mode, Point as GhosttyPoint, PointCoordinate, PointSpace,
@@ -41,13 +42,16 @@ use libghostty_vt::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use polling::{Event as PollEvent, Events, PollMode, Poller};
+use theme::Theme;
 use util::paths::{PathStyle, UrlExt as _};
 use vte::ansi::{Color, NamedColor, Rgb};
 
 use crate::{
     Cell, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
-    PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
-    SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion, adjusted_last_hovered_word,
+    PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionAnchor, SelectionRange,
+    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
+    adjusted_last_hovered_word, get_color_at_index,
+    mappings::colors::to_vte_rgb,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -133,28 +137,63 @@ impl CellFlags {
 
 pub(super) type GridIter<'a> = Box<dyn Iterator<Item = IndexedCell> + 'a>;
 
-/// Reusable libghostty render objects; rebuilt in place on every snapshot.
-struct RenderCache {
+/// How long a program may hold the screen before its updates are shown anyway.
+const RENDER_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// DECSCUSR 0: switch to the default cursor style.
+const RESET_CURSOR_STYLE: &[u8] = b"\x1b[0 q";
+
+/// libghostty's render objects and the cells copied out of them.
+struct Renderer {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    /// Each viewport row's cells, kept until libghostty marks the row dirty.
+    row_cells: Vec<(RowId, Vec<CellData>)>,
+    /// The frame on screen when the running program began a render hold.
+    held: Option<HeldFrame>,
+}
+
+#[derive(Clone)]
+struct Frame {
+    cells: Vec<IndexedCell>,
+    display_offset: usize,
+    cursor: Cursor,
+    cursor_blinking: bool,
+}
+
+struct HeldFrame {
+    frame: Frame,
+    since: Instant,
 }
 
 pub(super) struct Term {
     terminal: GhosttyTerminal<'static, 'static>,
-    render: RefCell<RenderCache>,
+    /// Shared with the render hold callback, which captures a frame into it.
+    renderer: Rc<RefCell<Renderer>>,
     config: TermConfig,
-    /// The selection as Zed last set it; libghostty keeps its own copy in grid coordinates.
-    selection: Option<Selection>,
+    /// The theme whose colors libghostty reports to programs.
+    theme: Option<Arc<Theme>>,
+    selection: Option<TermSelection>,
     vi_mode: bool,
     cursor_blinking: StdCell<bool>,
     events: EventSink,
 }
 
+/// The selection as Zed last set it; libghostty keeps its own copy in grid coordinates.
+struct TermSelection {
+    selection: Selection,
+    /// Follows the start's cell as output scrolls it.
+    start: TrackedGridRef,
+    /// The screen `start` belongs to.
+    screen: Screen,
+}
+
 // SAFETY: libghostty-vt has no thread affinity. Its headers document using
 // one terminal from an IO thread and a renderer thread as long as access is
 // serialized by a lock, which `TermLock` provides; `Term` is never used
-// without holding it.
+// without holding it. The `Rc` is shared only with callbacks owned by the
+// terminal, which run under the same lock.
 unsafe impl Send for Term {}
 
 pub(super) struct TermLock(Mutex<Term>);
@@ -212,7 +251,53 @@ pub(super) fn set_default_cursor_style(config: &mut TermConfig, cursor_shape: Se
 pub(super) fn apply_config(term: &TermLock, config: &TermConfig) {
     let mut term = term.lock();
     term.config = config.clone();
+    // Applies at the next DECSCUSR reset, so a style the program chose is kept.
     apply_cursor_style(&mut term.terminal, config.cursor_shape);
+}
+
+/// Gives libghostty the theme's colors, which it reports to programs that ask.
+pub(super) fn set_theme(term: &mut Term, theme: &Arc<Theme>) {
+    if term
+        .theme
+        .as_ref()
+        .is_some_and(|applied| Arc::ptr_eq(applied, theme))
+    {
+        return;
+    }
+    let color = |index| {
+        let rgb = to_vte_rgb(get_color_at_index(index, theme));
+        RgbColor {
+            r: rgb.r,
+            g: rgb.g,
+            b: rgb.b,
+        }
+    };
+    term.terminal
+        .set_default_fg_color(Some(color(256)))
+        .expect("set foreground color")
+        .set_default_bg_color(Some(color(257)))
+        .expect("set background color")
+        .set_default_cursor_color(Some(color(258)))
+        .expect("set cursor color")
+        .set_default_color_palette(Some(Palette(std::array::from_fn(color))))
+        .expect("set color palette");
+    term.theme = Some(theme.clone());
+}
+
+/// Writes bytes after aborting any escape sequence a previous writer left unfinished.
+fn write_from_ground(terminal: &mut GhosttyTerminal<'static, 'static>, bytes: &[u8]) {
+    if !terminal.is_vt_ground().expect("read parser state") {
+        // CAN cancels the sequence in progress.
+        terminal.vt_write(b"\x18");
+    }
+    terminal.vt_write(bytes);
+}
+
+/// Matches libghostty's reply to a kitty keyboard protocol query (`CSI ? flags u`).
+fn is_kitty_keyboard_reply(data: &[u8]) -> bool {
+    data.strip_prefix(b"\x1b[?")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+        .is_some_and(|flags| !flags.is_empty() && flags.iter().all(u8::is_ascii_digit))
 }
 
 fn apply_cursor_style(
@@ -258,6 +343,7 @@ pub(super) fn new_term(
         .set_scrollback_max_lines(Some(config.scrolling_history))
         .expect("set scrollback limit");
     apply_cursor_style(&mut terminal, config.cursor_shape);
+    terminal.vt_write(RESET_CURSOR_STYLE);
     if let AlternateScroll::Off = alternate_scroll {
         terminal
             .set_default_mode(Mode::ALT_SCROLL, false)
@@ -267,11 +353,27 @@ pub(super) fn new_term(
     let sink = events.clone();
     terminal
         .on_pty_write(move |_, data| {
-            sink.send(TerminalBackendEvent::PtyWrite(
-                String::from_utf8_lossy(data).into_owned(),
-            ))
+            // Zed encodes keys the legacy way, so programs must not think the
+            // kitty keyboard protocol is available.
+            if !is_kitty_keyboard_reply(data) {
+                sink.send(TerminalBackendEvent::PtyWrite(
+                    String::from_utf8_lossy(data).into_owned(),
+                ))
+            }
         })
         .expect("register pty write callback");
+    let renderer = Rc::new(RefCell::new(Renderer::new()));
+    let hold_renderer = renderer.clone();
+    terminal
+        .on_render_hold(move |terminal, held| {
+            let mut renderer = hold_renderer.borrow_mut();
+            let frame = held.then(|| renderer.frame(terminal));
+            renderer.held = frame.map(|frame| HeldFrame {
+                frame,
+                since: Instant::now(),
+            });
+        })
+        .expect("register render hold callback");
     let sink = events.clone();
     terminal
         .on_bell(move |_| sink.send(TerminalBackendEvent::Bell))
@@ -334,12 +436,9 @@ pub(super) fn new_term(
 
     let mut term = Term {
         terminal,
-        render: RefCell::new(RenderCache {
-            state: RenderState::new().expect("create render state"),
-            rows: RowIterator::new().expect("create row iterator"),
-            cells: CellIterator::new().expect("create cell iterator"),
-        }),
+        renderer,
         config: config.clone(),
+        theme: None,
         selection: None,
         vi_mode: false,
         cursor_blinking: StdCell::new(false),
@@ -392,13 +491,11 @@ impl OutputParser {
     }
 
     pub(super) fn advance(&mut self, term: &mut Term, bytes: &[u8]) {
-        if !std::mem::replace(&mut self.started, true)
-            && !term.terminal.is_vt_ground().expect("read parser state")
-        {
-            // CAN cancels the sequence in progress.
-            term.terminal.vt_write(b"\x18");
+        if std::mem::replace(&mut self.started, true) {
+            term.terminal.vt_write(bytes);
+        } else {
+            write_from_ground(&mut term.terminal, bytes);
         }
-        term.terminal.vt_write(bytes);
     }
 }
 
@@ -522,13 +619,17 @@ impl IoLoop {
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut events = Events::with_capacity(NonZeroUsize::new(64).unwrap());
         'io: loop {
+            let hold_time_left = self.term.lock().renderer.borrow().hold_time_left();
             events.clear();
-            if let Err(error) = self.poller.wait(&mut events, None) {
+            if let Err(error) = self.poller.wait(&mut events, hold_time_left) {
                 if error.kind() == ErrorKind::Interrupted {
                     continue;
                 }
                 log::error!("pty poll failed: {error}");
                 break;
+            }
+            if expire_render_hold(&mut self.term.lock()) {
+                self.events.send(TerminalBackendEvent::Wakeup);
             }
 
             if !self.drain_messages() {
@@ -667,15 +768,22 @@ fn screen_columns(term: &Term) -> usize {
     usize::from(term.terminal.cols().expect("read columns"))
 }
 
+/// Moves a point outside the grid onto its nearest cell.
+fn clamp_point(term: &Term, point: Point) -> Point {
+    Point::new(
+        point
+            .line
+            .clamp(-(history_rows(term) as i32), screen_rows(term) as i32 - 1),
+        point.column.min(screen_columns(term) - 1),
+    )
+}
+
 /// Zed points count lines from the top of the active screen; scrollback is negative.
 fn screen_point(term: &Term, point: Point) -> GhosttyPoint {
-    let history = history_rows(term) as i64;
-    let last_row = (history + screen_rows(term) as i64 - 1).max(0);
-    let y = (i64::from(point.line) + history).clamp(0, last_row);
-    let x = point.column.min(screen_columns(term).saturating_sub(1));
+    let point = clamp_point(term, point);
     GhosttyPoint::Screen(PointCoordinate {
-        x: x as u16,
-        y: y as u32,
+        x: point.column as u16,
+        y: (point.line + history_rows(term) as i32) as u32,
     })
 }
 
@@ -687,7 +795,12 @@ fn zed_point(term: &Term, coordinate: PointCoordinate) -> Point {
 }
 
 pub(super) fn display_offset(term: &Term) -> usize {
-    let scrollbar = term.terminal.scrollbar().expect("read scrollbar");
+    viewport_offset(&term.terminal)
+}
+
+/// Rows between the bottom of the viewport and the bottom of the screen.
+fn viewport_offset(terminal: &GhosttyTerminal<'static, 'static>) -> usize {
+    let scrollbar = terminal.scrollbar().expect("read scrollbar");
     (scrollbar.total - scrollbar.offset - scrollbar.len) as usize
 }
 
@@ -720,18 +833,26 @@ pub(super) fn used_lines(term: &Term) -> usize {
     if is_alt_screen(term) {
         return total_lines(term);
     }
-    history_rows(term) + cursor_line(term).max(0) as usize + 1
+    let cursor_line = cursor_line(term).max(0) as usize;
+    let last_occupied_line = (cursor_line + 1..screen_rows(term))
+        .rev()
+        .find(|&line| row_has_text(term, line as u32))
+        .unwrap_or(cursor_line);
+    history_rows(term) + last_occupied_line + 1
+}
+
+/// Whether a row of the active screen has any text.
+fn row_has_text(term: &Term, y: u32) -> bool {
+    (0..screen_columns(term) as u16).any(|x| {
+        term.terminal
+            .grid_ref(GhosttyPoint::Active(PointCoordinate { x, y }))
+            .and_then(|grid_ref| grid_ref.cell()?.has_text())
+            .expect("read cell")
+    })
 }
 
 fn is_alt_screen(term: &Term) -> bool {
-    term.terminal
-        .mode(Mode::ALT_SCREEN_SAVE)
-        .expect("read mode")
-        || term.terminal.mode(Mode::ALT_SCREEN).expect("read mode")
-        || term
-            .terminal
-            .mode(Mode::ALT_SCREEN_LEGACY)
-            .expect("read mode")
+    term.terminal.active_screen().expect("read active screen") == Screen::Alternate
 }
 
 pub(super) fn scroll_display(term: &mut Term, scroll: Scroll) {
@@ -768,87 +889,219 @@ fn display_top_row(term: &Term) -> usize {
 // --- Selection ---
 
 pub(super) fn set_selection(term: &mut Term, selection: Option<&Selection>) {
-    term.selection = selection.cloned();
+    term.selection = selection.map(|selection| TermSelection {
+        start: term
+            .terminal
+            .track_grid_ref(screen_point(term, selection.start.point))
+            .expect("track selection start"),
+        selection: selection.clone(),
+        screen: term.terminal.active_screen().expect("read active screen"),
+    });
     install_selection(term);
 }
 
 pub(super) fn update_selection(term: &mut Term, point: Point, side: SelectionSide) -> bool {
-    let Some(selection) = term.selection.as_mut() else {
+    let Some(tracked) = term.selection.as_mut() else {
         return false;
     };
-    selection.update(point, side);
+    tracked.selection.update(point, side);
     install_selection(term);
     true
 }
 
-fn install_selection(term: &Term) {
+fn install_selection(term: &mut Term) {
+    let history = history_rows(term) as i32;
+    let screen = term.terminal.active_screen().expect("read active screen");
+    if term
+        .selection
+        .as_ref()
+        .is_some_and(|tracked| tracked.screen != screen)
+    {
+        term.selection = None;
+    }
+    if let Some(tracked) = &mut term.selection {
+        match tracked
+            .start
+            .point(PointSpace::Screen)
+            .expect("resolve selection start")
+        {
+            Some(start) => {
+                tracked.selection.start.point =
+                    Point::new(start.y as i32 - history, usize::from(start.x))
+            }
+            // The start's row left the scrollback.
+            None => term.selection = None,
+        }
+    }
     let selection = term
         .selection
         .as_ref()
-        .and_then(|selection| ghostty_selection(term, selection));
+        .and_then(|tracked| ghostty_selection(term, &tracked.selection));
     term.terminal
         .set_selection(selection.as_ref())
         .expect("set selection");
 }
 
+/// The cells a selection covers, by alacritty's rules.
 fn ghostty_selection<'t>(term: &'t Term, selection: &Selection) -> Option<GhosttySelection<'t>> {
-    let (mut start, mut end) = (selection.start, selection.end);
-    if (end.point, end.side == SelectionSide::Right)
-        < (start.point, start.side == SelectionSide::Right)
-    {
+    let clamp = |anchor: SelectionAnchor| SelectionAnchor {
+        point: clamp_point(term, anchor.point),
+        side: anchor.side,
+    };
+    let (mut start, mut end) = (clamp(selection.start), clamp(selection.end));
+    if start.point > end.point {
         std::mem::swap(&mut start, &mut end);
     }
-    let grid_ref = |point| term.terminal.grid_ref(screen_point(term, point)).ok();
-    match selection.ty {
-        SelectionType::Simple => {
-            // A side says which half of the cell the pointer was on; a cell is
-            // selected once the pointer crosses its middle.
-            let mut start_point = start.point;
-            if start.side == SelectionSide::Right {
-                start_point.column += 1;
-            }
-            let mut end_point = end.point;
-            if end.side == SelectionSide::Left {
-                if end_point.column == 0 {
-                    return None;
-                }
-                end_point.column -= 1;
-            }
-            if end_point < start_point {
-                return None;
-            }
-            Some(GhosttySelection::new(
-                grid_ref(start_point)?,
-                grid_ref(end_point)?,
-                false,
-            ))
+    let (first, last) = match selection.ty {
+        SelectionType::Simple => simple_range(screen_columns(term), start, end)?,
+        SelectionType::Semantic => (word_start(term, start.point), word_end(term, end.point)),
+        SelectionType::Lines => (line_start(term, start.point), line_end(term, end.point)),
+    };
+    let grid_ref = |point| {
+        term.terminal
+            .grid_ref(screen_point(term, point))
+            .expect("resolve selection point")
+    };
+    Some(GhosttySelection::new(
+        grid_ref(first),
+        grid_ref(last),
+        false,
+    ))
+}
+
+/// A side says which half of a cell the pointer was on; a cell is selected
+/// once the pointer crosses its middle.
+fn simple_range(
+    columns: usize,
+    mut start: SelectionAnchor,
+    mut end: SelectionAnchor,
+) -> Option<(Point, Point)> {
+    let is_empty = (start.point == end.point && start.side == end.side)
+        || (start.side == SelectionSide::Right
+            && end.side == SelectionSide::Left
+            && start.point.line == end.point.line
+            && start.point.column + 1 == end.point.column);
+    if is_empty {
+        return None;
+    }
+    if end.side == SelectionSide::Left && start.point != end.point {
+        end.point = if end.point.column == 0 {
+            Point::new(end.point.line - 1, columns - 1)
+        } else {
+            Point::new(end.point.line, end.point.column - 1)
+        };
+    }
+    if start.side == SelectionSide::Right && start.point != end.point {
+        start.point = if start.point.column + 1 == columns {
+            Point::new(start.point.line + 1, 0)
+        } else {
+            Point::new(start.point.line, start.point.column + 1)
+        };
+    }
+    (start.point <= end.point).then_some((start.point, end.point))
+}
+
+fn previous_point(term: &Term, point: Point) -> Option<Point> {
+    if point.column > 0 {
+        Some(Point::new(point.line, point.column - 1))
+    } else {
+        (point.line > -(history_rows(term) as i32))
+            .then(|| Point::new(point.line - 1, screen_columns(term) - 1))
+    }
+}
+
+fn next_point(term: &Term, point: Point) -> Option<Point> {
+    if point.column + 1 < screen_columns(term) {
+        Some(Point::new(point.line, point.column + 1))
+    } else {
+        (point.line + 1 < screen_rows(term) as i32).then(|| Point::new(point.line + 1, 0))
+    }
+}
+
+/// Whether the line continues on the next one.
+fn line_wraps(term: &Term, line: i32) -> bool {
+    row_is_wrapped(term, (line + history_rows(term) as i32) as u32)
+}
+
+/// The character in a cell, or `None` for the spacer half of a wide character.
+fn cell_char(term: &Term, point: Point) -> Option<char> {
+    let cell = term
+        .terminal
+        .grid_ref(screen_point(term, point))
+        .and_then(|grid_ref| grid_ref.cell())
+        .expect("read cell");
+    if matches!(
+        cell.wide().expect("read cell width"),
+        CellWide::SpacerTail | CellWide::SpacerHead
+    ) {
+        return None;
+    }
+    let codepoint = cell.codepoint().expect("read cell codepoint");
+    Some(
+        char::from_u32(codepoint)
+            .filter(|&c| c != '\0')
+            .unwrap_or(' '),
+    )
+}
+
+fn is_word_boundary(term: &Term, point: Point) -> bool {
+    cell_char(term, point).is_some_and(|c| WORD_BOUNDARY_CHARS.contains(&c))
+}
+
+/// The first cell of the word around `point`, searching across wrapped lines.
+fn word_start(term: &Term, point: Point) -> Point {
+    let last_column = screen_columns(term) - 1;
+    let mut current = point;
+    while let Some(previous) = previous_point(term, current) {
+        if previous.column == last_column && !line_wraps(term, previous.line) {
+            break;
         }
-        SelectionType::Semantic => {
-            let word = |point| {
-                term.terminal
-                    .select_word(
-                        SelectWordOptions::new(grid_ref(point)?)
-                            .with_boundary_codepoints(WORD_BOUNDARY_CHARS),
-                    )
-                    .ok()
-                    .flatten()
-            };
-            let first = word(start.point)?;
-            let last = word(end.point)?;
-            Some(GhosttySelection::new(first.start(), last.end(), false))
-        }
-        SelectionType::Lines => {
-            let line = |point| {
-                term.terminal
-                    .select_line(SelectLineOptions::new(grid_ref(point)?))
-                    .ok()
-                    .flatten()
-            };
-            let first = line(start.point)?;
-            let last = line(end.point)?;
-            Some(GhosttySelection::new(first.start(), last.end(), false))
+        current = previous;
+        if is_word_boundary(term, previous) {
+            let mut after = next_point(term, previous);
+            while let Some(point) = after
+                && cell_char(term, point).is_none()
+            {
+                after = next_point(term, point);
+            }
+            return after.unwrap_or(previous);
         }
     }
+    current
+}
+
+/// The last cell of the word around `point`, searching across wrapped lines.
+fn word_end(term: &Term, point: Point) -> Point {
+    let last_column = screen_columns(term) - 1;
+    if point.column == last_column && !line_wraps(term, point.line) {
+        return point;
+    }
+    let mut current = point;
+    while let Some(next) = next_point(term, current) {
+        current = next;
+        if is_word_boundary(term, next) {
+            return previous_point(term, next).unwrap_or(next);
+        }
+        if next.column == last_column && !line_wraps(term, next.line) {
+            break;
+        }
+    }
+    current
+}
+
+fn line_start(term: &Term, mut point: Point) -> Point {
+    let top = -(history_rows(term) as i32);
+    while point.line > top && line_wraps(term, point.line - 1) {
+        point.line -= 1;
+    }
+    Point::new(point.line, 0)
+}
+
+fn line_end(term: &Term, mut point: Point) -> Point {
+    while point.line + 1 < screen_rows(term) as i32 && line_wraps(term, point.line) {
+        point.line += 1;
+    }
+    Point::new(point.line, screen_columns(term) - 1)
 }
 
 pub(super) fn selection_text(term: &Term) -> Option<String> {
@@ -966,127 +1219,211 @@ fn indexed_color(index: u8) -> Color {
     }
 }
 
-/// Copies the visible cells out of libghostty's render state.
-fn visible_cells(term: &Term) -> (Vec<IndexedCell>, usize) {
-    let display_offset = display_offset(term) as i32;
-    let mut cache = term.render.borrow_mut();
-    let RenderCache { state, rows, cells } = &mut *cache;
-    let snapshot = state.update(&term.terminal).expect("update render state");
-    let blinking = snapshot.cursor_blinking().expect("read cursor blinking");
-    if blinking != term.cursor_blinking.replace(blinking) {
-        term.events.send(TerminalBackendEvent::CursorBlinkingChange);
+/// Ends a render hold the program kept past the timeout. Returns whether it did.
+fn expire_render_hold(term: &mut Term) -> bool {
+    let mut renderer = term.renderer.borrow_mut();
+    if renderer.held.is_none() || renderer.hold_time_left().is_some() {
+        return false;
     }
-
-    let mut output = Vec::with_capacity(
-        usize::from(snapshot.rows().expect("read rows"))
-            * usize::from(snapshot.cols().expect("read columns")),
-    );
-    let mut graphemes = Vec::new();
-    let mut row_iteration = rows.update(&snapshot).expect("iterate rows");
-    let mut viewport_row: u32 = 0;
-    while let Some(row) = row_iteration.next() {
-        let line = viewport_row as i32 - display_offset;
-        let mut cell_iteration = cells.update(row).expect("iterate cells");
-        let mut column = 0;
-        while let Some(cell) = cell_iteration.next() {
-            let raw = cell.raw_cell().expect("read cell");
-            let style = cell.style().expect("read cell style");
-            let mut data = CellData {
-                fg: zed_color(style.fg_color, NamedColor::Foreground),
-                bg: match raw.content_tag().expect("read cell content") {
-                    CellContentTag::BgColorPalette => {
-                        indexed_color(raw.bg_color_palette().expect("read cell background").0)
-                    }
-                    CellContentTag::BgColorRgb => {
-                        let rgb = raw.bg_color_rgb().expect("read cell background");
-                        Color::Spec(Rgb {
-                            r: rgb.r,
-                            g: rgb.g,
-                            b: rgb.b,
-                        })
-                    }
-                    _ => zed_color(style.bg_color, NamedColor::Background),
-                },
-                ..CellData::default()
-            };
-
-            graphemes.resize(cell.graphemes_len().expect("read graphemes") as usize, ' ');
-            cell.graphemes_buf(&mut graphemes).expect("read graphemes");
-            if let Some((&first, rest)) = graphemes.split_first() {
-                data.character = first;
-                if !rest.is_empty() {
-                    data.zerowidth = Some(Arc::from(rest));
-                }
-            }
-
-            let flags = &mut data.flags;
-            flags.set(CellFlags::INVERSE, style.inverse);
-            flags.set(
-                CellFlags::WIDE_CHAR_SPACER,
-                matches!(
-                    raw.wide().expect("read cell width"),
-                    CellWide::SpacerTail | CellWide::SpacerHead
-                ),
-            );
-            flags.set(CellFlags::DIM, style.faint);
-            flags.set(CellFlags::UNDERLINE, style.underline != Underline::None);
-            flags.set(CellFlags::UNDERCURL, style.underline == Underline::Curly);
-            flags.set(CellFlags::STRIKEOUT, style.strikethrough);
-            flags.set(CellFlags::BOLD, style.bold);
-            flags.set(CellFlags::ITALIC, style.italic);
-
-            if raw.has_hyperlink().expect("read cell hyperlink") {
-                let grid_ref = term
-                    .terminal
-                    .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
-                        x: column,
-                        y: viewport_row,
-                    }))
-                    .expect("resolve visible cell");
-                data.hyperlink =
-                    hyperlink_uri(&grid_ref).map(|uri| Hyperlink::new(None::<String>, uri));
-            }
-
-            output.push(IndexedCell {
-                point: Point::new(line, usize::from(column)),
-                cell: Cell { cell: data },
-            });
-            column += 1;
-        }
-        viewport_row += 1;
-    }
-    (output, display_offset as usize)
+    renderer.held = None;
+    drop(renderer);
+    // Lets the program's next hold start a new one.
+    term.terminal
+        .set_mode(Mode::SYNC_OUTPUT, false)
+        .expect("end synchronized output");
+    true
 }
 
-fn cursor(term: &Term) -> Cursor {
-    let mut cache = term.render.borrow_mut();
-    let snapshot = cache
-        .state
-        .update(&term.terminal)
-        .expect("update render state");
-    let cursor = snapshot.cursor().expect("read cursor");
-    let shape = if !cursor.visible {
-        CursorShape::Hidden
-    } else {
-        match cursor.visual_style {
-            CursorVisualStyle::Bar => CursorShape::Bar,
-            CursorVisualStyle::Underline => CursorShape::Underline,
-            CursorVisualStyle::BlockHollow => CursorShape::HollowBlock,
-            _ => CursorShape::Block,
+impl Renderer {
+    fn new() -> Self {
+        Self {
+            state: RenderState::new().expect("create render state"),
+            rows: RowIterator::new().expect("create row iterator"),
+            cells: CellIterator::new().expect("create cell iterator"),
+            row_cells: Vec::new(),
+            held: None,
         }
-    };
-    Cursor {
-        shape,
-        point: Point::new(
-            cursor_line(term),
-            usize::from(term.terminal.cursor_x().expect("read cursor column")),
-        ),
     }
+
+    /// The frame to show: the held one during a render hold, otherwise the live screen.
+    fn display_frame(&mut self, terminal: &GhosttyTerminal<'static, 'static>) -> Frame {
+        if self.hold_time_left().is_none() {
+            self.held = None;
+        }
+        match &self.held {
+            Some(held) => held.frame.clone(),
+            None => self.frame(terminal),
+        }
+    }
+
+    /// Time left before the current render hold is ignored; `None` without one or once it has expired.
+    fn hold_time_left(&self) -> Option<Duration> {
+        RENDER_HOLD_TIMEOUT.checked_sub(self.held.as_ref()?.since.elapsed())
+    }
+
+    /// Copies the visible screen out of the terminal.
+    fn frame(&mut self, terminal: &GhosttyTerminal<'static, 'static>) -> Frame {
+        let display_offset = viewport_offset(terminal);
+        let Self {
+            state,
+            rows,
+            cells,
+            row_cells,
+            ..
+        } = self;
+        let snapshot = state.update(terminal).expect("update render state");
+        let all_dirty = snapshot.dirty().expect("read dirty state") == Dirty::Full;
+        let cursor_state = snapshot.cursor().expect("read cursor");
+        {
+            let mut row_iteration = rows.update(&snapshot).expect("iterate rows");
+            let mut viewport_row = 0;
+            while let Some(row) = row_iteration.next() {
+                let id = row.id().expect("read row id");
+                let cached = !all_dirty
+                    && !row.dirty().expect("read row dirty state")
+                    && row_cells
+                        .get(viewport_row)
+                        .is_some_and(|(cached_id, _)| *cached_id == id);
+                if !cached {
+                    let row_data = (id, read_row(terminal, cells, row, viewport_row as u32));
+                    match row_cells.get_mut(viewport_row) {
+                        Some(slot) => *slot = row_data,
+                        None => row_cells.push(row_data),
+                    }
+                }
+                viewport_row += 1;
+            }
+            row_cells.truncate(viewport_row);
+        }
+        snapshot.clean().expect("mark render state clean");
+
+        let cells = row_cells
+            .iter()
+            .enumerate()
+            .flat_map(|(row, (_, cells))| {
+                let line = row as i32 - display_offset as i32;
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, cell)| IndexedCell {
+                        point: Point::new(line, column),
+                        cell: Cell { cell: cell.clone() },
+                    })
+            })
+            .collect();
+
+        let shape = if !cursor_state.visible {
+            CursorShape::Hidden
+        } else {
+            match cursor_state.visual_style {
+                CursorVisualStyle::Bar => CursorShape::Bar,
+                CursorVisualStyle::Underline => CursorShape::Underline,
+                CursorVisualStyle::BlockHollow => CursorShape::HollowBlock,
+                _ => CursorShape::Block,
+            }
+        };
+        let mut point = Point::new(
+            i32::from(terminal.cursor_y().expect("read cursor row")),
+            usize::from(terminal.cursor_x().expect("read cursor column")),
+        );
+        // A cursor on the right half of a wide character is drawn over all of it.
+        if cursor_state
+            .viewport
+            .is_some_and(|viewport| viewport.at_wide_tail)
+        {
+            point.column -= 1;
+        }
+        Frame {
+            cells,
+            display_offset,
+            cursor: Cursor { shape, point },
+            cursor_blinking: cursor_state.blinking,
+        }
+    }
+}
+
+/// Copies one row out of libghostty's render state.
+fn read_row(
+    terminal: &GhosttyTerminal<'static, 'static>,
+    cells: &mut CellIterator<'static>,
+    row: &RowIteration<'static, '_>,
+    viewport_row: u32,
+) -> Vec<CellData> {
+    let mut output = Vec::new();
+    let mut graphemes = Vec::new();
+    let mut cell_iteration = cells.update(row).expect("iterate cells");
+    let mut column = 0;
+    while let Some(cell) = cell_iteration.next() {
+        let raw = cell.raw_cell().expect("read cell");
+        let style = cell.style().expect("read cell style");
+        let mut data = CellData {
+            fg: zed_color(style.fg_color, NamedColor::Foreground),
+            bg: match raw.content_tag().expect("read cell content") {
+                CellContentTag::BgColorPalette => {
+                    indexed_color(raw.bg_color_palette().expect("read cell background").0)
+                }
+                CellContentTag::BgColorRgb => {
+                    let rgb = raw.bg_color_rgb().expect("read cell background");
+                    Color::Spec(Rgb {
+                        r: rgb.r,
+                        g: rgb.g,
+                        b: rgb.b,
+                    })
+                }
+                _ => zed_color(style.bg_color, NamedColor::Background),
+            },
+            ..CellData::default()
+        };
+
+        graphemes.resize(cell.graphemes_len().expect("read graphemes") as usize, ' ');
+        cell.graphemes_buf(&mut graphemes).expect("read graphemes");
+        if let Some((&first, rest)) = graphemes.split_first() {
+            data.character = first;
+            if !rest.is_empty() {
+                data.zerowidth = Some(Arc::from(rest));
+            }
+        }
+
+        let flags = &mut data.flags;
+        flags.set(CellFlags::INVERSE, style.inverse);
+        flags.set(
+            CellFlags::WIDE_CHAR_SPACER,
+            raw.wide().expect("read cell width") == CellWide::SpacerTail,
+        );
+        flags.set(CellFlags::DIM, style.faint);
+        flags.set(CellFlags::UNDERLINE, style.underline != Underline::None);
+        flags.set(CellFlags::UNDERCURL, style.underline == Underline::Curly);
+        flags.set(CellFlags::STRIKEOUT, style.strikethrough);
+        flags.set(CellFlags::BOLD, style.bold);
+        flags.set(CellFlags::ITALIC, style.italic);
+
+        if raw.has_hyperlink().expect("read cell hyperlink") {
+            let grid_ref = terminal
+                .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
+                    x: column,
+                    y: viewport_row,
+                }))
+                .expect("resolve visible cell");
+            data.hyperlink =
+                hyperlink_uri(&grid_ref).map(|uri| Hyperlink::new(None::<String>, uri));
+        }
+
+        output.push(data);
+        column += 1;
+    }
+    output
 }
 
 pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
-    let (cells, display_offset) = visible_cells(term);
-    let cursor = cursor(term);
+    let Frame {
+        cells,
+        display_offset,
+        cursor,
+        cursor_blinking,
+    } = term.renderer.borrow_mut().display_frame(&term.terminal);
+    if cursor_blinking != term.cursor_blinking.replace(cursor_blinking) {
+        term.events.send(TerminalBackendEvent::CursorBlinkingChange);
+    }
     let columns = screen_columns(term);
     let screen_lines = screen_rows(term);
     let total_lines = total_lines(term);
@@ -1136,7 +1473,13 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
 
 pub(super) fn renderable_cells(term: &Term) -> RenderableCells<'static> {
     RenderableCells {
-        cells: Box::new(visible_cells(term).0.into_iter()),
+        cells: Box::new(
+            term.renderer
+                .borrow_mut()
+                .display_frame(&term.terminal)
+                .cells
+                .into_iter(),
+        ),
     }
 }
 
@@ -1193,7 +1536,7 @@ pub(super) fn clear_saved_screen(term: &mut Term) {
         sequence.push_str(&format!("\x1b[{cursor_row}S\x1b[3J"));
     }
     sequence.push_str(&format!("\x1b[1;{}H", column + 1));
-    term.terminal.vt_write(sequence.as_bytes());
+    write_from_ground(&mut term.terminal, sequence.as_bytes());
 }
 
 /// Not supported by this backend yet: the scrollback keeps its size.
@@ -1357,7 +1700,14 @@ fn line_text(term: &Term, point: Point) -> LineText {
     line
 }
 
-fn hyperlink_uri(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> Option<String> {
+fn hyperlink_uri(grid_ref: &GridRef<'_>) -> Option<String> {
+    if !grid_ref
+        .cell()
+        .and_then(|cell| cell.has_hyperlink())
+        .expect("read cell hyperlink")
+    {
+        return None;
+    }
     let mut uri = vec![0; 2048];
     let len = loop {
         match grid_ref.hyperlink_uri(&mut uri) {
@@ -1690,5 +2040,196 @@ impl Iterator for RenderableCells<'_> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.cells.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+    use gpui::{bounds, point, px, size};
+
+    use super::*;
+
+    fn test_term(
+        cursor_shape: SettingsCursorShape,
+    ) -> (Arc<TermLock>, UnboundedReceiver<PtyEvent>) {
+        let bounds = TerminalBounds::new(
+            px(10.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(100.), px(30.))),
+        );
+        let (events_tx, events_rx) = unbounded();
+        let term = new_term(
+            &pty_term_config(100, cursor_shape),
+            bounds,
+            events_tx,
+            AlternateScroll::On,
+            0,
+        );
+        (term, events_rx)
+    }
+
+    fn line_text(frame: &Frame, line: i32) -> String {
+        frame
+            .cells
+            .iter()
+            .filter(|cell| cell.point.line == line)
+            .map(|cell| cell.character())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn live_frame(term: &Term) -> Frame {
+        term.renderer.borrow_mut().display_frame(&term.terminal)
+    }
+
+    fn select(term: &mut Term, ty: SelectionType, start: Point, end: Point) {
+        let mut selection = Selection::new(ty, start, SelectionSide::Left);
+        selection.update(end, SelectionSide::Right);
+        set_selection(term, Some(&selection));
+    }
+
+    #[test]
+    fn starts_with_the_configured_cursor_shape() {
+        let (term, _events) = test_term(SettingsCursorShape::Bar);
+        assert_eq!(live_frame(&term.lock()).cursor.shape, CursorShape::Bar);
+    }
+
+    #[test]
+    fn keeps_the_programs_cursor_style_when_the_default_changes() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        term.lock().terminal.vt_write(b"\x1b[6 q");
+        apply_config(&term, &pty_term_config(100, SettingsCursorShape::Hollow));
+        assert_eq!(live_frame(&term.lock()).cursor.shape, CursorShape::Bar);
+    }
+
+    #[test]
+    fn does_not_answer_kitty_keyboard_queries() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        term.lock().terminal.vt_write(b"\x1b[?u\x1b[c");
+        let mut replies = Vec::new();
+        while let Ok(PtyEvent::Event(TerminalBackendEvent::PtyWrite(reply), _)) = events.try_recv()
+        {
+            replies.push(reply);
+        }
+        assert_eq!(replies, ["\x1b[?62;1;6;22c"]);
+    }
+
+    #[test]
+    fn shows_the_frame_from_the_start_of_a_render_hold() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"before\x1b[?2026h\rafter ");
+        assert_eq!(line_text(&live_frame(&term), 0), "before");
+        term.terminal.vt_write(b"\x1b[?2026l");
+        assert_eq!(line_text(&live_frame(&term), 0), "after");
+    }
+
+    #[test]
+    fn simple_selection_edges_wrap_to_neighboring_lines() {
+        let anchor = |line, column, side| SelectionAnchor {
+            point: Point::new(line, column),
+            side,
+        };
+        // Ending on the left half of the first column ends on the line above.
+        assert_eq!(
+            simple_range(
+                10,
+                anchor(0, 2, SelectionSide::Left),
+                anchor(1, 0, SelectionSide::Left)
+            ),
+            Some((Point::new(0, 2), Point::new(0, 9)))
+        );
+        // Starting on the right half of the last column starts on the line below.
+        assert_eq!(
+            simple_range(
+                10,
+                anchor(0, 9, SelectionSide::Right),
+                anchor(1, 3, SelectionSide::Right)
+            ),
+            Some((Point::new(1, 0), Point::new(1, 3)))
+        );
+        assert_eq!(
+            simple_range(
+                10,
+                anchor(0, 2, SelectionSide::Right),
+                anchor(0, 3, SelectionSide::Left)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_and_line_selections_cover_blank_cells() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"foo bar");
+        select(
+            &mut term,
+            SelectionType::Semantic,
+            Point::new(0, 1),
+            Point::new(0, 1),
+        );
+        assert_eq!(selection_text(&term).as_deref(), Some("foo"));
+
+        // A blank cell is a word boundary of its own.
+        select(
+            &mut term,
+            SelectionType::Semantic,
+            Point::new(0, 8),
+            Point::new(0, 8),
+        );
+        assert_eq!(
+            selection_range(&term).map(|range| (range.start, range.end)),
+            Some((Point::new(0, 8), Point::new(0, 8)))
+        );
+
+        select(
+            &mut term,
+            SelectionType::Lines,
+            Point::new(2, 0),
+            Point::new(2, 0),
+        );
+        assert_eq!(
+            selection_range(&term).map(|range| (range.start, range.end)),
+            Some((Point::new(2, 0), Point::new(2, 9)))
+        );
+    }
+
+    #[test]
+    fn selection_start_follows_scrolled_output() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"one\r\ntwo\r\nthree");
+        select(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(1, 0),
+            Point::new(1, 2),
+        );
+        term.terminal.vt_write(b"\r\nfour");
+        assert!(update_selection(
+            &mut term,
+            Point::new(0, 2),
+            SelectionSide::Right
+        ));
+        assert_eq!(selection_text(&term).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn switching_screens_clears_the_selection() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"one");
+        select(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(0, 0),
+            Point::new(0, 2),
+        );
+        term.terminal.vt_write(b"\x1b[?1049h");
+        update_selection(&mut term, Point::new(0, 1), SelectionSide::Right);
+        assert_eq!(selection_text(&term), None);
     }
 }

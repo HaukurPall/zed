@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
-use theme::{ActiveTheme, Theme};
+use theme::{ActiveTheme, GlobalTheme, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
@@ -75,7 +75,7 @@ use crate::backend::{
     find_from_terminal_point, full_content_range, history_size, last_non_empty_lines, make_content,
     new_term, open_pty, palette_color, pty_options, pty_term_config, renderable_cells, resize,
     screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
-    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    set_default_cursor_style, set_selection as set_term_selection, set_theme, shrink_to_used,
     spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
@@ -1549,6 +1549,9 @@ impl TerminalBuilder {
             }
             anyhow::Ok(())
         });
+        if cx.has_global::<GlobalTheme>() {
+            set_theme(&mut self.terminal.term.lock(), cx.theme());
+        }
         self.terminal
     }
 
@@ -2562,6 +2565,10 @@ impl Terminal {
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let term = self.term.clone();
         let mut terminal = term.lock_unfair();
+        // Headless hosts and tests run terminals without a theme.
+        if cx.has_global::<GlobalTheme>() {
+            set_theme(&mut terminal, cx.theme());
+        }
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
             self.process_terminal_event(&e, &mut terminal, window, cx)
