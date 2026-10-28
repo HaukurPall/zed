@@ -9,12 +9,14 @@ use std::{
     convert::Infallible,
     io::{self, ErrorKind, Read, Write},
     num::NonZeroUsize,
+    ops::Range as StdRange,
     os::fd::AsRawFd,
     path::PathBuf,
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -39,6 +41,7 @@ use libghostty_vt::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use polling::{Event as PollEvent, Events, PollMode, Poller};
+use util::paths::{PathStyle, UrlExt as _};
 use vte::ansi::{Color, NamedColor, Rgb};
 
 use crate::{
@@ -376,14 +379,25 @@ pub(super) fn resize(term: &mut Term, bounds: TerminalBounds) {
 }
 
 /// Feeds bytes that arrive outside the PTY IO loop into a terminal.
-pub(super) struct OutputParser;
+///
+/// libghostty keeps its parser state in the terminal, so a new parser first
+/// aborts any escape sequence a previous one left unfinished.
+pub(super) struct OutputParser {
+    started: bool,
+}
 
 impl OutputParser {
     pub(super) fn new() -> Self {
-        Self
+        Self { started: false }
     }
 
     pub(super) fn advance(&mut self, term: &mut Term, bytes: &[u8]) {
+        if !std::mem::replace(&mut self.started, true)
+            && !term.terminal.is_vt_ground().expect("read parser state")
+        {
+            // CAN cancels the sequence in progress.
+            term.terminal.vt_write(b"\x18");
+        }
         term.terminal.vt_write(bytes);
     }
 }
@@ -968,7 +982,6 @@ fn visible_cells(term: &Term) -> (Vec<IndexedCell>, usize) {
             * usize::from(snapshot.cols().expect("read columns")),
     );
     let mut graphemes = Vec::new();
-    let mut uri = Vec::new();
     let mut row_iteration = rows.update(&snapshot).expect("iterate rows");
     let mut viewport_row: u32 = 0;
     while let Some(row) = row_iteration.next() {
@@ -1022,28 +1035,16 @@ fn visible_cells(term: &Term) -> (Vec<IndexedCell>, usize) {
             flags.set(CellFlags::BOLD, style.bold);
             flags.set(CellFlags::ITALIC, style.italic);
 
-            if raw.has_hyperlink().expect("read cell hyperlink")
-                && let Ok(grid_ref) =
-                    term.terminal
-                        .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
-                            x: column,
-                            y: viewport_row,
-                        }))
-            {
-                uri.resize(uri.capacity().max(256), 0);
-                let len = loop {
-                    match grid_ref.hyperlink_uri(&mut uri) {
-                        Ok(len) => break len,
-                        Err(libghostty_vt::Error::OutOfSpace { required }) => {
-                            uri.resize(required, 0)
-                        }
-                        Err(error) => panic!("read hyperlink uri: {error}"),
-                    }
-                };
-                data.hyperlink = Some(Hyperlink::new(
-                    None::<String>,
-                    String::from_utf8_lossy(&uri[..len]).into_owned(),
-                ));
+            if raw.has_hyperlink().expect("read cell hyperlink") {
+                let grid_ref = term
+                    .terminal
+                    .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
+                        x: column,
+                        y: viewport_row,
+                    }))
+                    .expect("resolve visible cell");
+                data.hyperlink =
+                    hyperlink_uri(&grid_ref).map(|uri| Hyperlink::new(None::<String>, uri));
             }
 
             output.push(IndexedCell {
@@ -1228,6 +1229,8 @@ pub(super) fn search_matches(_term: &Term, _searcher: Search) -> Vec<Range> {
     Vec::new()
 }
 
+const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://|zed://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`']+"#;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HyperlinkMatch {
     pub(crate) text: String,
@@ -1235,36 +1238,336 @@ pub(crate) struct HyperlinkMatch {
     pub(crate) range: Range,
 }
 
-#[derive(Default)]
-pub(crate) struct RegexSearches;
+pub(crate) struct RegexSearches {
+    url_regex: regex::Regex,
+    path_hyperlink_regexes: Vec<regex::Regex>,
+    path_hyperlink_timeout: Duration,
+}
 
-impl RegexSearches {
-    pub(crate) fn new(
-        _path_hyperlink_regexes: impl IntoIterator<Item: AsRef<str>>,
-        _path_hyperlink_timeout: std::time::Duration,
-    ) -> Self {
-        Self
+impl Default for RegexSearches {
+    fn default() -> Self {
+        Self::new(Vec::<String>::new(), Duration::ZERO)
     }
 }
 
-/// Finds the OSC 8 hyperlink under `point`; URL and path detection are not supported yet.
+impl RegexSearches {
+    pub(crate) fn new(
+        path_hyperlink_regexes: impl IntoIterator<Item: AsRef<str>>,
+        path_hyperlink_timeout: Duration,
+    ) -> Self {
+        Self {
+            url_regex: regex::Regex::new(URL_REGEX).expect("URL regex is valid"),
+            path_hyperlink_regexes: path_hyperlink_regexes
+                .into_iter()
+                .filter_map(|regex| {
+                    regex::Regex::new(regex.as_ref())
+                        .inspect_err(|error| {
+                            log::warn!(
+                                "Ignoring path hyperlink regex specified in \
+                                 `terminal.path_hyperlink_regexes`:\n\n\t{}\n\nError: {error}",
+                                regex.as_ref(),
+                            )
+                        })
+                        .ok()
+                })
+                .collect(),
+            path_hyperlink_timeout,
+        }
+    }
+}
+
+/// The text of a wrapped line, with the grid position of each character.
+struct LineText {
+    text: String,
+    /// Byte offset of each character in `text`, with its first and last cell.
+    chars: Vec<(usize, Point, Point)>,
+}
+
+impl LineText {
+    fn char_index_at(&self, point: Point) -> Option<usize> {
+        self.chars
+            .iter()
+            .position(|(_, start, end)| *start <= point && point <= *end)
+    }
+
+    fn char_index_of_byte(&self, offset: usize) -> usize {
+        self.chars.partition_point(|(byte, _, _)| *byte < offset)
+    }
+
+    /// Grid range of the characters in `bytes`, which must be non-empty.
+    fn range(&self, bytes: StdRange<usize>) -> Range {
+        let first = self.char_index_of_byte(bytes.start);
+        let last = self.char_index_of_byte(bytes.end) - 1;
+        Range::new(self.chars[first].1, self.chars[last].2)
+    }
+}
+
+fn row_is_wrapped(term: &Term, y: u32) -> bool {
+    term.terminal
+        .grid_ref(GhosttyPoint::Screen(PointCoordinate { x: 0, y }))
+        .and_then(|grid_ref| grid_ref.row()?.is_wrapped())
+        .expect("read row")
+}
+
+/// The wrapped line containing `point`, read cell by cell.
+fn line_text(term: &Term, point: Point) -> LineText {
+    let GhosttyPoint::Screen(coordinate) = screen_point(term, point) else {
+        unreachable!()
+    };
+    let last_row = (history_rows(term) + screen_rows(term) - 1) as u32;
+    let mut first = coordinate.y;
+    while first > 0 && row_is_wrapped(term, first - 1) {
+        first -= 1;
+    }
+    let mut last = coordinate.y;
+    while last < last_row && row_is_wrapped(term, last) {
+        last += 1;
+    }
+
+    let columns = screen_columns(term) as u16;
+    let mut line = LineText {
+        text: String::new(),
+        chars: Vec::new(),
+    };
+    let mut graphemes = ['\0'; 16];
+    for y in first..=last {
+        for x in 0..columns {
+            let grid_ref = term
+                .terminal
+                .grid_ref(GhosttyPoint::Screen(PointCoordinate { x, y }))
+                .expect("resolve cell");
+            let cell = grid_ref.cell().expect("read cell");
+            let wide = cell.wide().expect("read cell width");
+            if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
+                continue;
+            }
+            let start = zed_point(term, PointCoordinate { x, y });
+            let mut end = start;
+            if wide == CellWide::Wide {
+                end.column += 1;
+            }
+            line.chars.push((line.text.len(), start, end));
+            let len = grid_ref.graphemes(&mut graphemes).unwrap_or(0);
+            match graphemes[..len].first() {
+                None | Some('\t') => line.text.push(' '),
+                Some(_) => line.text.extend(&graphemes[..len]),
+            }
+        }
+    }
+    line
+}
+
+fn hyperlink_uri(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> Option<String> {
+    let mut uri = vec![0; 2048];
+    let len = loop {
+        match grid_ref.hyperlink_uri(&mut uri) {
+            Ok(len) => break len,
+            Err(libghostty_vt::Error::OutOfSpace { required }) => uri.resize(required, 0),
+            Err(error) => panic!("read hyperlink uri: {error}"),
+        }
+    };
+    (len > 0).then(|| String::from_utf8_lossy(&uri[..len]).into_owned())
+}
+
+/// The OSC 8 link at `point`, spanning the neighboring cells that carry the same link.
+fn osc8_hyperlink(term: &Term, point: Point) -> Option<(String, Range)> {
+    let uri_at = |point| {
+        let grid_ref = term.terminal.grid_ref(screen_point(term, point)).ok()?;
+        hyperlink_uri(&grid_ref)
+    };
+    let uri = uri_at(point)?;
+    let line = line_text(term, point);
+    let index = line.char_index_at(point)?;
+    let same_link = |&(_, start, _): &(usize, Point, Point)| uri_at(start).as_ref() == Some(&uri);
+    let first = line.chars[..index]
+        .iter()
+        .rposition(|char| !same_link(char))
+        .map_or(0, |position| position + 1);
+    let last = line.chars[index..]
+        .iter()
+        .position(|char| !same_link(char))
+        .map_or(line.chars.len(), |position| index + position)
+        - 1;
+    Some((uri, Range::new(line.chars[first].1, line.chars[last].2)))
+}
+
+/// Drops trailing punctuation that usually ends the sentence rather than the URL.
+fn trim_url_punctuation(url: &str) -> &str {
+    let (open, mut close) = url.chars().fold((0, 0), |(open, close), c| match c {
+        '(' => (open + 1, close),
+        ')' => (open, close + 1),
+        _ => (open, close),
+    });
+    let mut url = url;
+    while let Some(last) = url.chars().last() {
+        let trim = match last {
+            '.' | ',' | ':' | ';' | '(' => true,
+            ')' if close > open => {
+                close -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        url = &url[..url.len() - last.len_utf8()];
+    }
+    url
+}
+
+/// Byte offset just past the first unbalanced `(`, if any.
+fn first_unbalanced_open_paren(s: &str) -> Option<usize> {
+    let mut balance: i32 = 0;
+    let mut first_unmatched = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => {
+                if balance == 0 {
+                    first_unmatched = Some(i + c.len_utf8());
+                }
+                balance += 1;
+            }
+            ')' => {
+                balance -= 1;
+                if balance <= 0 {
+                    balance = 0;
+                    first_unmatched = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    first_unmatched.filter(|_| balance > 0)
+}
+
+fn url_match(line: &LineText, hovered: usize, regex: &regex::Regex) -> Option<(String, Range)> {
+    let found = regex
+        .find_iter(&line.text)
+        .find(|found| found.range().contains(&hovered))?;
+    let url = trim_url_punctuation(found.as_str());
+    if url.is_empty() || found.start() + url.len() <= hovered {
+        return None;
+    }
+    Some((
+        url.to_string(),
+        line.range(found.start()..found.start() + url.len()),
+    ))
+}
+
+fn path_match(
+    line: &LineText,
+    hovered: usize,
+    regexes: &[regex::Regex],
+    timeout: Duration,
+) -> Option<(String, Range)> {
+    if regexes.is_empty() || timeout.is_zero() {
+        return None;
+    }
+    let started = Instant::now();
+    let text = line.text.trim_ascii_end();
+    if text.len() <= hovered {
+        return None;
+    }
+    for regex in regexes {
+        let mut path_found = false;
+        for captures in regex.captures_iter(text) {
+            path_found = true;
+            let whole = captures
+                .get(0)
+                .expect("capture 0 is the whole match")
+                .range();
+            let parse = |name: &str| {
+                captures
+                    .name(name)
+                    .and_then(|capture| capture.as_str().parse::<u32>().ok())
+            };
+            let (mut path_range, position) = match captures.name("path") {
+                Some(path) => (
+                    path.range(),
+                    parse("line").map(|line| (line, parse("column"))),
+                ),
+                None => (whole.clone(), None),
+            };
+            let mut link_range = captures.name("link").map_or(whole, |link| link.range());
+            if let Some(trim) = first_unbalanced_open_paren(&text[path_range.clone()]) {
+                path_range.start += trim;
+                link_range.start = link_range.start.max(path_range.start);
+            }
+            if link_range.is_empty() || !link_range.contains(&hovered) {
+                continue;
+            }
+            let mut path = text[path_range].to_string();
+            if let Some((line_number, column)) = position {
+                path += &format!(":{line_number}");
+                if let Some(column) = column {
+                    path += &format!(":{column}");
+                }
+            }
+            return Some((path, line.range(link_range)));
+        }
+        if path_found {
+            return None;
+        }
+        if started.elapsed() > timeout {
+            log::warn!(
+                "Timed out processing path hyperlink regexes after {}ms",
+                started.elapsed().as_millis()
+            );
+            return None;
+        }
+    }
+    None
+}
+
+/// Treats `file://` links as paths, so line numbers at their end are handled like a path's.
+fn normalize_hyperlink_match(
+    text: String,
+    is_url: bool,
+    range: Range,
+    path_style: PathStyle,
+) -> HyperlinkMatch {
+    if !is_url || !text.starts_with("file://") {
+        return HyperlinkMatch {
+            text,
+            is_url,
+            range,
+        };
+    }
+    let path = url::Url::parse(&text)
+        .ok()
+        .and_then(|url| url.to_file_path_ext(path_style).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| text.strip_prefix("file://").unwrap_or(&text).to_string());
+    HyperlinkMatch {
+        text: path,
+        is_url: false,
+        range,
+    }
+}
+
+/// Finds the OSC 8 link, URL or path under `point`.
 pub(super) fn find_from_terminal_point(
     term: &Term,
     point: Point,
-    _regex_searches: &mut RegexSearches,
-    _path_style: util::paths::PathStyle,
+    regex_searches: &mut RegexSearches,
+    path_style: PathStyle,
 ) -> Option<HyperlinkMatch> {
-    let grid_ref = term.terminal.grid_ref(screen_point(term, point)).ok()?;
-    let mut uri = vec![0; 2048];
-    let len = grid_ref.hyperlink_uri(&mut uri).ok()?;
-    if len == 0 {
-        return None;
+    if let Some((uri, range)) = osc8_hyperlink(term, point) {
+        return Some(normalize_hyperlink_match(uri, true, range, path_style));
     }
-    Some(HyperlinkMatch {
-        text: String::from_utf8_lossy(&uri[..len]).into_owned(),
-        is_url: true,
-        range: Range::new(point, point),
-    })
+    let line = line_text(term, point);
+    let hovered = line.chars[line.char_index_at(point)?].0;
+    if let Some((url, range)) = url_match(&line, hovered, &regex_searches.url_regex) {
+        return Some(normalize_hyperlink_match(url, true, range, path_style));
+    }
+    let (path, range) = path_match(
+        &line,
+        hovered,
+        &regex_searches.path_hyperlink_regexes,
+        regex_searches.path_hyperlink_timeout,
+    )?;
+    Some(normalize_hyperlink_match(path, false, range, path_style))
 }
 
 // --- Zed type impls ---
