@@ -1,6 +1,14 @@
 mod mappings;
 
+#[cfg(not(feature = "ghostty"))]
 mod alacritty;
+#[cfg(feature = "ghostty")]
+mod ghostty;
+
+#[cfg(not(feature = "ghostty"))]
+use alacritty as backend;
+#[cfg(feature = "ghostty")]
+use ghostty as backend;
 mod pty_info;
 pub mod terminal_settings;
 
@@ -59,8 +67,8 @@ use gpui::{
 };
 
 #[cfg(not(windows))]
-use crate::alacritty::current_child_signal_mask;
-use crate::alacritty::{
+use crate::backend::current_child_signal_mask;
+use crate::backend::{
     CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
     SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
     content_text, cursor_blinking, cursor_line, display_offset, display_only_term_config,
@@ -653,6 +661,7 @@ mod domain_tests {
     }
 
     #[test]
+    #[cfg(not(feature = "ghostty"))]
     fn terminal_cell_clone_shares_extra_storage() {
         let mut cell = Cell::default();
         cell.push_zerowidth('a');
@@ -5031,6 +5040,7 @@ mod tests {
         })
     }
 
+    #[cfg(not(feature = "ghostty"))]
     #[gpui::test]
     async fn test_replace_display_output_rebuilds_screen_and_accepts_appends(
         cx: &mut TestAppContext,
