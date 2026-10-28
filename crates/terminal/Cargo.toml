@@ -6,6 +6,8 @@ publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [features]
+# Use libghostty-vt instead of alacritty_terminal for terminal emulation (Linux and macOS).
+ghostty = ["dep:libghostty-vt", "dep:polling"]
 test-support = [
     "collections/test-support",
     "gpui/test-support",
@@ -29,6 +31,7 @@ futures-lite.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 libc.workspace = true
+libghostty-vt = { workspace = true, optional = true }
 log.workspace = true
 regex.workspace = true
 release_channel.workspace = true
@@ -45,6 +48,7 @@ util.workspace = true
 urlencoding.workspace = true
 vte.workspace = true
 parking_lot.workspace = true
+polling = { workspace = true, optional = true }
 percent-encoding.workspace = true
 
 [target.'cfg(windows)'.dependencies]
