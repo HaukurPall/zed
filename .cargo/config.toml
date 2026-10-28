@@ -22,3 +22,5 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "12.0"
+# Zig's Debug mode makes libghostty-vt orders of magnitude slower.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
