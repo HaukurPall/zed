@@ -30,6 +30,7 @@ use alacritty_terminal::{
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
+use theme::Theme;
 use util::paths::PathStyle;
 use vte::ansi::{Handler, Processor, Rgb, StdSyncHandler};
 #[cfg(target_os = "windows")]
@@ -151,6 +152,9 @@ pub(super) fn set_default_cursor_style(config: &mut TermConfig, cursor_shape: Se
 pub(super) fn apply_config(term: &TermLock, config: &TermConfig) {
     term.lock().set_options(config.clone());
 }
+
+/// Colors come from the theme when Zed answers a `ColorRequest`, so there is nothing to store.
+pub(super) fn set_theme(_term: &mut Term, _theme: &Arc<Theme>) {}
 
 #[cfg(not(windows))]
 pub(super) fn current_child_signal_mask() -> io::Result<tty::SignalMask> {
