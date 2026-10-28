@@ -15,7 +15,6 @@ use futures::{
     channel::mpsc::{UnboundedReceiver, unbounded},
 };
 
-use alacritty_terminal::grid::Dimensions as _;
 use itertools::Itertools as _;
 use mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -62,16 +61,16 @@ use gpui::{
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
-    AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
-    vi_motion,
+    CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
+    SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
+    content_text, cursor_blinking, cursor_line, display_offset, display_only_term_config,
+    find_from_terminal_point, full_content_range, history_size, last_non_empty_lines, make_content,
+    new_term, open_pty, palette_color, pty_options, pty_term_config, renderable_cells, resize,
+    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -124,7 +123,7 @@ enum ViMotion {
 
 #[derive(Clone, Debug)]
 pub struct Search {
-    search: AlacrittySearch,
+    search: SearchData,
 }
 
 #[derive(Clone, Debug)]
@@ -323,17 +322,17 @@ pub struct Hyperlink {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum HyperlinkData {
-    Alacritty(AlacrittyHyperlink),
+    Backend(HyperlinkHandle),
     Owned { id: Option<Arc<str>>, uri: Arc<str> },
 }
 
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct Cell {
-    cell: AlacrittyCell,
+    cell: CellData,
 }
 
 pub struct RenderableCells<'a> {
-    cells: AlacrittyGridIterator<'a>,
+    cells: GridIter<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +544,65 @@ impl Default for Content {
             bottom_row_occupied: false,
         }
     }
+}
+
+/// Carries the hovered word over to a new content snapshot when the grid only shifted.
+fn adjusted_last_hovered_word(
+    columns: usize,
+    screen_lines: usize,
+    total_lines: usize,
+    display_offset: usize,
+    last_content: &Content,
+) -> (Option<HoveredWord>, GridLinesChange) {
+    let grid_size_changed =
+        columns != last_content.columns || screen_lines != last_content.screen_lines;
+
+    let Some(total_lines_delta) = total_lines.checked_signed_diff(last_content.total_lines) else {
+        return (None, GridLinesChange::Unchanged);
+    };
+
+    let Some(display_offset_delta) =
+        display_offset.checked_signed_diff(last_content.display_offset)
+    else {
+        return (None, GridLinesChange::Unchanged);
+    };
+
+    let grid_visible_lines_changed = total_lines_delta != display_offset_delta;
+
+    let grid_lines_change = if grid_size_changed || grid_visible_lines_changed {
+        GridLinesChange::Changed
+    } else {
+        GridLinesChange::Unchanged
+    };
+
+    let hovered_word = if let Some(last_hovered_word) = last_content.last_hovered_word.as_ref()
+        && grid_lines_change == GridLinesChange::Unchanged
+    {
+        if total_lines_delta == 0 {
+            // Viewport and content are the same, we can reuse existing match
+            Some(last_hovered_word.clone())
+        } else {
+            // Content is changed, but viewport is shifted the same, reuse
+            // the match, but need to shift the match lines by the same amount.
+            let mut adjusted_hovered_word = last_hovered_word.clone();
+            adjusted_hovered_word.word_match = Range::new(
+                Point::new(
+                    last_hovered_word.word_match.start().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.start().column,
+                ),
+                Point::new(
+                    last_hovered_word.word_match.end().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.end().column,
+                ),
+            );
+
+            Some(adjusted_hovered_word)
+        }
+    } else {
+        None
+    };
+
+    (hovered_word, grid_lines_change)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1525,9 +1583,9 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
-    term: Arc<AlacrittyTermLock>,
-    term_config: AlacrittyTermConfig,
-    output_processor: Option<Processor<StdSyncHandler>>,
+    term: Arc<TermLock>,
+    term_config: TermConfig,
+    output_processor: Option<OutputParser>,
     output_events_tx: Option<futures::channel::mpsc::UnboundedSender<PtyEvent>>,
     output_generation: u64,
     events: VecDeque<InternalEvent>,
@@ -1687,8 +1745,7 @@ impl Terminal {
                 self.write_to_pty(format(self.last_content.terminal_bounds).into_bytes())
             }
             TerminalBackendEvent::CursorBlinkingChange => {
-                let terminal = self.term.lock();
-                let blinking = terminal.cursor_style().blinking;
+                let blinking = cursor_blinking(&self.term.lock());
                 cx.emit(Event::BlinkChanged(blinking));
             }
             TerminalBackendEvent::Bell => {
@@ -1716,7 +1773,7 @@ impl Terminal {
                 // we might respond with out of date value if a "set color" sequence is immediately
                 // followed by a color request sequence.
 
-                let color = self.term.lock().colors()[index]
+                let color = palette_color(&self.term.lock(), index)
                     .unwrap_or_else(|| to_vte_rgb(get_color_at_index(index, cx.theme().as_ref())));
                 self.write_to_pty(format(color).into_bytes());
             }
@@ -1733,7 +1790,7 @@ impl Terminal {
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
-        term: &mut AlacrittyTerm,
+        term: &mut Term,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1869,7 +1926,7 @@ impl Terminal {
                     self.path_style,
                 ) {
                     Some(hyperlink) => {
-                        let history_size = term.history_size();
+                        let history_size = history_size(term);
                         self.process_hyperlink(hyperlink, *open, history_size, cx);
                     }
                     None => {
@@ -1880,7 +1937,7 @@ impl Terminal {
             InternalEvent::ProcessHyperlink(hyperlink, open) => {
                 // history_size must be read here since process_hyperlink cannot lock term
                 // (sync() already holds the lock when dispatching events)
-                let history_size = term.history_size();
+                let history_size = history_size(term);
                 self.process_hyperlink(hyperlink.clone(), *open, history_size, cx);
             }
         }
@@ -1996,8 +2053,8 @@ impl Terminal {
     pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let mut term = self.term.lock();
         self.output_processor
-            .get_or_insert_with(Processor::<StdSyncHandler>::new)
-            .advance(&mut *term, bytes);
+            .get_or_insert_with(OutputParser::new)
+            .advance(&mut term, bytes);
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
@@ -2049,9 +2106,7 @@ impl Terminal {
         self.cwd_history.clear();
         self.pending_cwd_boundary = None;
         self.write_raw_output(bytes, cx);
-        cx.emit(Event::BlinkChanged(
-            self.term.lock().cursor_style().blinking,
-        ));
+        cx.emit(Event::BlinkChanged(cursor_blinking(&self.term.lock())));
         cx.emit(Event::BreadcrumbsChanged);
         cx.emit(Event::NewNavigationTarget(None));
         cx.emit(Event::OutputReplaced);
@@ -2325,8 +2380,8 @@ impl Terminal {
         if !self.is_remote_terminal && input.contains(&b'\r') {
             let term = self.term.lock_unfair();
             self.pending_cwd_boundary = Some(Self::scrollback_position(
-                term.grid().cursor.point.line.0,
-                term.history_size(),
+                cursor_line(&term),
+                history_size(&term),
             ));
         }
 
@@ -2518,8 +2573,7 @@ impl Terminal {
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
         let term = self.term.lock_unfair();
-        let content = term.renderable_content();
-        f(RenderableCells::new(content.display_iter))
+        f(renderable_cells(&term))
     }
 
     pub fn get_content(&self) -> String {
@@ -3011,7 +3065,7 @@ impl Terminal {
 
         let scrollback_position = self.pending_cwd_boundary.take().unwrap_or_else(|| {
             let term = self.term.lock_unfair();
-            Self::scrollback_position(term.grid().cursor.point.line.0, term.history_size())
+            Self::scrollback_position(cursor_line(&term), history_size(&term))
         });
         self.cwd_history.push(CwdHistoryEntry {
             scrollback_position,
@@ -3382,7 +3436,7 @@ fn spawn_task_subprocess(
     args: Vec<String>,
     env: HashMap<String, String>,
     working_directory: Option<PathBuf>,
-    term: Arc<AlacrittyTermLock>,
+    term: Arc<TermLock>,
     events_tx: futures::channel::mpsc::UnboundedSender<PtyEvent>,
     executor: &BackgroundExecutor,
 ) -> Result<SubprocessHandle> {
@@ -3414,7 +3468,7 @@ fn spawn_task_subprocess(
                 let events_tx = events_tx.clone();
                 async move {
                     let Some(mut reader) = reader else { return };
-                    let mut processor = Processor::<StdSyncHandler>::new();
+                    let mut processor = OutputParser::new();
                     let mut buffer = [0u8; 8192];
                     let mut previous_byte_was_cr = false;
                     loop {
@@ -3429,7 +3483,7 @@ fn spawn_task_subprocess(
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
                                 {
                                     let mut term = term.lock();
-                                    processor.advance(&mut *term, &converted);
+                                    processor.advance(&mut term, &converted);
                                 }
                                 events_tx
                                     .unbounded_send(PtyEvent::Event(
