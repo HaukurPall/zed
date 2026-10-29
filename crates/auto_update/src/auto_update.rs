@@ -33,6 +33,7 @@ use util::command::new_command;
 use workspace::Workspace;
 
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
+const LAST_RUN_VERSION_KEY: &str = "auto-updater-last-run-version";
 
 #[derive(Debug)]
 struct MissingDependencyError(String);
@@ -990,8 +991,22 @@ impl AutoUpdater {
 
     pub fn should_show_update_notification(&self, cx: &App) -> Task<Result<bool>> {
         let kvp = KeyValueStore::global(cx);
+        let mut version = self.current_version.clone();
+        version.pre = semver::Prerelease::EMPTY;
+        version.build = semver::BuildMetadata::EMPTY;
         cx.background_spawn(async move {
-            Ok(kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
+            // Package managers update Zed without the updater, so a newer version
+            // than the last run's counts as an update too.
+            let last_run_version = kvp
+                .read_kvp(LAST_RUN_VERSION_KEY)?
+                .map(|last| Version::parse(&last))
+                .transpose()?;
+            if last_run_version.as_ref() != Some(&version) {
+                kvp.write_kvp(LAST_RUN_VERSION_KEY.to_string(), version.to_string())
+                    .await?;
+            }
+            let updated_elsewhere = last_run_version.is_some_and(|last| last < version);
+            Ok(updated_elsewhere || kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
         })
     }
 }
