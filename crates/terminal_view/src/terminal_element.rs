@@ -1,12 +1,12 @@
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Element,
-    ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement,
-    LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Corners, DispatchPhase,
+    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hitbox, Hsla, ImageId, InputHandler, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point as GpuiPoint, RenderImage, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity,
+    WhiteSpace, Window, div, fill, point, px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -14,7 +14,7 @@ use settings::Settings;
 use std::time::Instant;
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, MouseInputMode, NamedColor, Point,
-    Range, Terminal, TerminalBounds,
+    Range, Terminal, TerminalBounds, TerminalImage, TerminalImageLayer,
     is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
     terminal_settings::TerminalSettings,
 };
@@ -25,8 +25,9 @@ use ui::{ParentElement, Tooltip};
 use util::ResultExt;
 use workspace::Workspace;
 
+use collections::{HashMap, HashSet};
 use std::mem;
-use std::{fmt::Debug, rc::Rc};
+use std::{fmt::Debug, rc::Rc, sync::Arc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
@@ -44,6 +45,7 @@ pub struct LayoutState {
     display_offset: usize,
     hyperlink_tooltip: Option<AnyElement>,
     block_below_cursor_element: Option<AnyElement>,
+    images: Vec<TerminalImage>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
 }
@@ -1374,8 +1376,10 @@ impl Element for TerminalElement {
                     cursor_char,
                     selection,
                     cursor,
+                    images,
                     ..
                 } = &self.terminal.read(cx).last_content;
+                let images = images.clone();
                 let display_offset = *display_offset;
 
                 // searches, highlights to a single range representations
@@ -1565,6 +1569,7 @@ impl Element for TerminalElement {
                     display_offset,
                     hyperlink_tooltip,
                     block_below_cursor_element,
+                    images,
                     base_text_style: text_style,
                     content_mode,
                 }
@@ -1621,6 +1626,7 @@ impl Element for TerminalElement {
                 window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
             }
 
+            let terminal_view = self.terminal_view.clone();
             let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
@@ -1647,9 +1653,16 @@ impl Element for TerminalElement {
                         }
                     });
 
+                    let paint_images = |layer, window: &mut Window| {
+                        for image in layout.images.iter().filter(|image| image.layer == layer) {
+                            paint_image(image, origin, &layout.dimensions, window);
+                        }
+                    };
+                    paint_images(TerminalImageLayer::BelowBackground, window);
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
                     }
+                    paint_images(TerminalImageLayer::BelowText, window);
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
@@ -1680,6 +1693,8 @@ impl Element for TerminalElement {
                     for block_element_rect in &layout.block_element_rects {
                         block_element_rect.paint(origin, &layout.dimensions, window);
                     }
+                    paint_images(TerminalImageLayer::AboveText, window);
+                    free_unpainted_images(&terminal_view, &layout.images, window, cx);
                     let text_paint_time = text_paint_start.elapsed();
 
                     if let Some(text_to_mark) = &marked_text_cloned
@@ -1877,6 +1892,73 @@ impl InputHandler for TerminalInputHandler {
     ) -> Option<usize> {
         None
     }
+}
+
+/// Frees the window's copies of images that were drawn before but not now.
+fn free_unpainted_images(
+    terminal_view: &Entity<TerminalView>,
+    images: &[TerminalImage],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let painted: HashMap<ImageId, Arc<RenderImage>> = images
+        .iter()
+        .map(|image| (image.image.id, image.image.clone()))
+        .collect();
+    let shown: HashSet<ImageId> = painted.keys().copied().collect();
+    let previous = terminal_view.update(cx, |view, _| {
+        mem::replace(&mut view.painted_images, painted)
+    });
+    for (id, image) in previous {
+        if !shown.contains(&id) {
+            window.drop_image(image).log_err();
+        }
+    }
+}
+
+/// Draws the image's source rectangle over its cells.
+fn paint_image(
+    image: &TerminalImage,
+    origin: GpuiPoint<Pixels>,
+    dimensions: &TerminalBounds,
+    window: &mut Window,
+) {
+    let cell = size(dimensions.cell_width, dimensions.line_height);
+    let bounds = Bounds::new(
+        point(
+            origin.x + cell.width * image.bounds.origin.x,
+            origin.y + cell.height * image.bounds.origin.y,
+        ),
+        size(
+            cell.width * image.bounds.size.width,
+            cell.height * image.bounds.size.height,
+        ),
+    );
+    // Scale the whole image so that its source rectangle covers `bounds`, which clips the rest.
+    let scale = size(
+        bounds.size.width / image.source.size.width,
+        bounds.size.height / image.source.size.height,
+    );
+    let image_bounds = Bounds::new(
+        point(
+            bounds.origin.x - scale.width * image.source.origin.x,
+            bounds.origin.y - scale.height * image.source.origin.y,
+        ),
+        size(
+            scale.width * image.image_size.width,
+            scale.height * image.image_size.height,
+        ),
+    );
+    window
+        .paint_image(
+            bounds,
+            image_bounds,
+            Corners::default(),
+            image.image.clone(),
+            0,
+            false,
+        )
+        .log_err();
 }
 
 pub fn is_blank(cell: &Cell) -> bool {
