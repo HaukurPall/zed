@@ -2831,6 +2831,27 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_text_in_compressed_scrollback() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        apply_config(&term, &pty_term_config(10_000, SettingsCursorShape::Block));
+        let mut term = term.lock();
+        for line in 0..5_000 {
+            term.terminal
+                .vt_write(format!("line {line}\r\n").as_bytes());
+        }
+        let needle = || Search::literal("line 1234").expect("literal search");
+        let before = search_matches(&mut term, needle());
+        assert_eq!(before.len(), 1);
+        while term
+            .terminal
+            .compress(CompressionMode::Incremental)
+            .unwrap()
+            == CompressionResult::Pending
+        {}
+        assert_eq!(search_matches(&mut term, needle()), before);
+    }
+
+    #[test]
     fn search_finds_literal_text_in_scrollback_from_oldest_to_newest() {
         let (term, _events) = test_term(SettingsCursorShape::Block);
         let mut term = term.lock();
