@@ -1279,6 +1279,8 @@ impl TerminalBuilder {
             suppress_hyperlink_throttle_once: false,
             #[cfg(any(test, feature = "test-support"))]
             pty_write_log: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            shell_in_foreground: None,
         };
 
         TerminalBuilder {
@@ -1591,6 +1593,8 @@ impl TerminalBuilder {
                 suppress_hyperlink_throttle_once: false,
                 #[cfg(any(test, feature = "test-support"))]
                 pty_write_log: Default::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                shell_in_foreground: None,
             };
 
             if !activation_script.is_empty() && no_task {
@@ -1791,6 +1795,8 @@ pub struct Terminal {
     suppress_hyperlink_throttle_once: bool,
     #[cfg(any(test, feature = "test-support"))]
     pty_write_log: std::cell::RefCell<Vec<Vec<u8>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    shell_in_foreground: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3414,6 +3420,28 @@ impl Terminal {
             TerminalType::Pty { info, .. } => info.shell_cwd(),
             TerminalType::DisplayOnly => None,
         }
+    }
+
+    /// Whether the shell the terminal started is the foreground process.
+    /// `None` when there is no local shell to ask.
+    pub fn shell_in_foreground(&self) -> Option<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.shell_in_foreground.is_some() {
+            return self.shell_in_foreground;
+        }
+        if self.is_remote_terminal {
+            return None;
+        }
+        match &self.terminal_type {
+            // Windows reports the shell's own process, whatever runs in it.
+            TerminalType::Pty { .. } if cfg!(unix) => Some(self.is_shell_in_foreground()),
+            TerminalType::Pty { .. } | TerminalType::DisplayOnly => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_shell_in_foreground(&mut self, shell_in_foreground: Option<bool>) {
+        self.shell_in_foreground = shell_in_foreground;
     }
 
     /// Normalizes the command name of the foreground process, if one is known.
