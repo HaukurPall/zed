@@ -1032,7 +1032,14 @@ impl AgentTerminal {
 
     fn refresh_metadata(&mut self, cx: &mut App) -> bool {
         let title_changed = self.refresh_title(cx);
-        let current_working_directory = self.view.read(cx).terminal().read(cx).working_directory();
+        // The shell's directory, not the foreground program's: a program that
+        // changes its own directory shouldn't move where the thread restores.
+        let current_working_directory = self
+            .view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .shell_working_directory();
         let working_directory_changed = current_working_directory
             .as_ref()
             .is_some_and(|current| self.working_directory.as_ref() != Some(current));
@@ -6547,7 +6554,7 @@ impl AgentPanel {
 
         let (working_directory, custom_title, initial_title) = {
             let terminal_view = terminal_view.read(cx);
-            let working_directory = terminal_view.terminal().read(cx).working_directory();
+            let working_directory = terminal_view.terminal().read(cx).shell_working_directory();
             let custom_title = terminal_view
                 .custom_title()
                 .map(|title| SharedString::from(title.to_string()));

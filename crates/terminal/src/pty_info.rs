@@ -146,6 +146,12 @@ impl PtyProcessInfo {
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
 
+    /// The working directory of the spawned child, usually the shell, as of the
+    /// last refresh.
+    pub(crate) fn child_cwd(&self) -> Option<PathBuf> {
+        self.get_child()?.cwd().map(PathBuf::from)
+    }
+
     #[cfg(unix)]
     pub(crate) fn kill_current_process(&self) -> bool {
         let Some(pid) = self.pid_getter.pid() else {
@@ -288,5 +294,27 @@ mod tests {
             churned_len <= 2,
             "foreground process churn retained {churned_len} process entries"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test needs a real child process and may block"
+    )]
+    fn child_cwd_is_the_spawned_childs_directory() {
+        let directory = tempfile::tempdir().expect("create a temporary directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(directory.path())
+            .spawn()
+            .expect("failed to spawn child process");
+        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, child.id()));
+        assert!(info.load_for_test().is_some());
+        assert_eq!(
+            info.child_cwd(),
+            Some(directory.path().canonicalize().expect("canonicalize"))
+        );
+        child.kill().expect("failed to kill child process");
+        child.wait().expect("failed to wait for child process");
     }
 }
