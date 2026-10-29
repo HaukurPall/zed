@@ -1343,15 +1343,15 @@ fn subscribe_for_terminal_events(
     vec![terminal_subscription, terminal_events_subscription]
 }
 
-fn regex_search_for_query(query: &SearchQuery) -> Option<Search> {
+fn search_for_query(query: &SearchQuery) -> Option<Search> {
     let str = query.as_str();
-    if query.is_regex() {
+    if query.is_regex() && Search::SUPPORTS_REGEX {
         if str == "." {
             return None;
         }
         Search::new(str)
     } else {
-        Search::new(&regex::escape(str))
+        Search::literal(str)
     }
 }
 
@@ -2107,7 +2107,7 @@ impl SearchableItem for TerminalView {
         SearchOptions {
             case: false,
             word: false,
-            regex: true,
+            regex: Search::SUPPORTS_REGEX,
             replacement: false,
             selection: false,
             select_all: false,
@@ -2182,7 +2182,7 @@ impl SearchableItem for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Self::Match>> {
-        if let Some(s) = regex_search_for_query(&query) {
+        if let Some(s) = search_for_query(&query) {
             self.terminal()
                 .update(cx, |term, cx| term.find_matches(s, cx))
         } else {
