@@ -18177,6 +18177,7 @@ dependencies = [
  "settings",
  "sysinfo 0.39.6",
  "task",
+ "tempfile",
  "theme",
  "theme_settings",
  "thiserror 2.0.17",
