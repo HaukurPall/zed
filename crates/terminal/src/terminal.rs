@@ -72,16 +72,15 @@ use crate::backend::{
     CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
     SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
     content_text, cursor_blinking, cursor_line, display_offset, display_only_term_config,
-    find_from_terminal_point, full_content_range, history_size, last_non_empty_lines, make_content,
-    new_term, open_pty, palette_color, pty_options, pty_term_config, renderable_cells, resize,
-    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
-    set_default_cursor_style, set_selection as set_term_selection, set_theme, shrink_to_used,
-    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    encode_key, find_from_terminal_point, full_content_range, history_size, last_non_empty_lines,
+    make_content, new_term, open_pty, palette_color, pty_options, pty_term_config,
+    renderable_cells, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
+    selection_text, set_default_cursor_style, set_selection as set_term_selection, set_theme,
+    shrink_to_used, spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
-use crate::mappings::keys::to_esc_str;
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -330,8 +329,12 @@ pub struct Hyperlink {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum HyperlinkData {
+    #[cfg_attr(feature = "ghostty", expect(dead_code, reason = "alacritty only"))]
     Backend(HyperlinkHandle),
-    Owned { id: Option<Arc<str>>, uri: Arc<str> },
+    Owned {
+        id: Option<Arc<str>>,
+        uri: Arc<str>,
+    },
 }
 
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
@@ -790,13 +793,18 @@ type TextAreaSizeFormatter = Arc<dyn Fn(TerminalBounds) -> String + Sync + Send 
 
 #[derive(Clone)]
 pub(crate) enum TerminalBackendEvent {
+    #[cfg_attr(feature = "ghostty", expect(dead_code, reason = "alacritty only"))]
     MouseCursorDirty,
     Title(String),
     ResetTitle,
     ClipboardStore(String),
+    // libghostty answers this and the next requests itself.
+    #[cfg_attr(feature = "ghostty", expect(dead_code, reason = "alacritty only"))]
     ClipboardLoad(ClipboardFormatter),
+    #[cfg_attr(feature = "ghostty", expect(dead_code, reason = "alacritty only"))]
     ColorRequest(usize, ColorFormatter),
     PtyWrite(String),
+    #[cfg_attr(feature = "ghostty", expect(dead_code, reason = "alacritty only"))]
     TextAreaSizeRequest(TextAreaSizeFormatter),
     CursorBlinkingChange,
     Wakeup,
@@ -2530,7 +2538,12 @@ impl Terminal {
         }
 
         // Keep default terminal behavior
-        let esc = to_esc_str(keystroke, self.last_content.mode, option_as_meta);
+        let esc = encode_key(
+            &self.term,
+            keystroke,
+            self.last_content.mode,
+            option_as_meta,
+        );
         if let Some(esc) = esc {
             match esc {
                 Cow::Borrowed(string) => self.input(string.as_bytes()),
@@ -3029,8 +3042,8 @@ impl Terminal {
     pub fn find_matches(&self, searcher: Search, cx: &Context<Self>) -> Task<Vec<Range>> {
         let term = self.term.clone();
         cx.background_spawn(async move {
-            let term = term.lock();
-            search_matches(&term, searcher)
+            let mut term = term.lock();
+            search_matches(&mut term, searcher)
         })
     }
 
