@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [features]
 # Use libghostty-vt instead of alacritty_terminal for terminal emulation (Linux and macOS).
-ghostty = ["dep:libghostty-vt", "dep:polling"]
+ghostty = ["dep:image", "dep:libghostty-vt", "dep:polling"]
 test-support = [
     "collections/test-support",
     "gpui/test-support",
@@ -29,6 +29,7 @@ collections.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 gpui.workspace = true
+image = { workspace = true, optional = true }
 itertools.workspace = true
 libc.workspace = true
 libghostty-vt = { workspace = true, optional = true }

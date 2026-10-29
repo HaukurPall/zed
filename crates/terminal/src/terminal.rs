@@ -63,7 +63,8 @@ pub use vte::ansi::{Color, NamedColor, Rgb};
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point as GpuiPoint, Rgba, ScrollEvent, Size, Task, TouchPhase, Window, actions, black, px,
+    Point as GpuiPoint, RenderImage, Rgba, ScrollEvent, Size, Task, TouchPhase, Window, actions,
+    black, px,
 };
 
 #[cfg(not(windows))]
@@ -515,6 +516,30 @@ pub struct Content {
     pub scrolled_to_top: bool,
     pub scrolled_to_bottom: bool,
     pub bottom_row_occupied: bool,
+    /// Images on screen, in drawing order.
+    pub images: Vec<TerminalImage>,
+}
+
+/// An image a program placed in the terminal, such as with the kitty graphics protocol.
+#[derive(Clone)]
+pub struct TerminalImage {
+    pub image: Arc<RenderImage>,
+    pub layer: TerminalImageLayer,
+    /// Where to draw it, in cells from the top-left corner of the viewport.
+    /// It can start above or left of the viewport.
+    pub bounds: Bounds<f32>,
+    /// The part of the image to draw, in image pixels.
+    pub source: Bounds<f32>,
+    /// The whole image's size, in image pixels.
+    pub image_size: Size<f32>,
+}
+
+/// What a terminal image is drawn over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TerminalImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -553,6 +578,7 @@ impl Default for Content {
             scrolled_to_top: false,
             scrolled_to_bottom: false,
             bottom_row_occupied: false,
+            images: Vec::new(),
         }
     }
 }
