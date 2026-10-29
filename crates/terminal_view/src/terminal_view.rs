@@ -4,15 +4,16 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use collections::HashMap;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, Corners, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, ScrollEvent, Styled, Subscription,
-    Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
+    ExternalPaths, FocusHandle, Focusable, Font, ImageId, KeyContext, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, RenderImage,
+    ScrollEvent, Styled, Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -161,6 +162,8 @@ pub struct TerminalView {
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
+    /// Images drawn in the last frame, freed from the window once they are no longer shown.
+    pub(crate) painted_images: HashMap<ImageId, Arc<RenderImage>>,
     ime_state: Option<ImeState>,
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
@@ -285,6 +288,11 @@ impl TerminalView {
             focus_out,
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
+            cx.on_release_in(window, |terminal_view, window, _| {
+                for (_, image) in terminal_view.painted_images.drain() {
+                    window.drop_image(image).log_err();
+                }
+            }),
         ];
 
         Self {
@@ -309,6 +317,7 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
+            painted_images: HashMap::default(),
             needs_serialize: false,
             custom_title: None,
             ime_state: None,
