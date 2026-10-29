@@ -26,18 +26,25 @@ use alacritty_terminal::{
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
+use gpui::Keystroke;
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
+    key::{
+        Action as KeyAction, Encoder as KeyEncoder, Event as KeyEvent, Key, Mods as KeyMods,
+        OptionAsAlt,
+    },
     render::{
         CellIterator, CursorVisualStyle, Dirty, RenderState, RowId, RowIteration, RowIterator,
     },
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
+    search::{MatchBuffer, Search as GhosttySearch},
     selection::{FormatOptions, Selection as GhosttySelection},
-    style::{Palette, RgbColor, StyleColor, Underline},
+    style::{Id as StyleId, Palette, RgbColor, Style, StyleColor, Underline},
     terminal::{
-        ClipboardWriteError, ConformanceLevel, CursorStyle, DeviceAttributeFeature,
-        DeviceAttributes, DeviceType, Mode, Point as GhosttyPoint, PointCoordinate, PointSpace,
-        PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
+        ClipboardWriteError, CompressionActivity, CompressionMode, CompressionResult,
+        ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
+        Point as GhosttyPoint, PointCoordinate, PointSpace, PrimaryDeviceAttributes,
+        ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
     },
 };
 use parking_lot::{Mutex, MutexGuard};
@@ -51,7 +58,7 @@ use crate::{
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionAnchor, SelectionRange,
     SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
     adjusted_last_hovered_word, get_color_at_index,
-    mappings::colors::to_vte_rgb,
+    mappings::{colors::to_vte_rgb, keys::to_esc_str},
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -77,7 +84,7 @@ pub(super) type HyperlinkHandle = Infallible;
 
 #[derive(Clone, Debug)]
 pub(super) struct SearchData {
-    regex: regex::Regex,
+    needle: String,
 }
 
 #[derive(Clone)]
@@ -140,6 +147,12 @@ pub(super) type GridIter<'a> = Box<dyn Iterator<Item = IndexedCell> + 'a>;
 /// How long a program may hold the screen before its updates are shown anyway.
 const RENDER_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Output-free time before scrollback compression starts, as in Ghostty.
+const COMPRESSION_IDLE: Duration = Duration::from_millis(250);
+
+/// Pause between compression steps, which releases the lock in between.
+const COMPRESSION_STEP: Duration = Duration::from_millis(1);
+
 /// DECSCUSR 0: switch to the default cursor style.
 const RESET_CURSOR_STYLE: &[u8] = b"\x1b[0 q";
 
@@ -150,8 +163,17 @@ struct Renderer {
     cells: CellIterator<'static>,
     /// Each viewport row's cells, kept until libghostty marks the row dirty.
     row_cells: Vec<(RowId, Vec<CellData>)>,
-    /// The frame on screen when the running program began a render hold.
-    held: Option<HeldFrame>,
+    /// The scroll position and cursor that go with `row_cells`.
+    display_offset: usize,
+    cursor: Cursor,
+    cursor_blinking: bool,
+    /// When the running program began holding back its updates. Until it
+    /// ends, the rows copied at the last refresh keep being shown.
+    held_since: Option<Instant>,
+    /// Whether a frame was shown since the last refresh. A hold that starts
+    /// then refreshes first, so a program that draws back to back still has
+    /// its latest complete frame shown, at most once per frame Zed draws.
+    shown_since_refresh: bool,
 }
 
 #[derive(Clone)]
@@ -160,11 +182,6 @@ struct Frame {
     display_offset: usize,
     cursor: Cursor,
     cursor_blinking: bool,
-}
-
-struct HeldFrame {
-    frame: Frame,
-    since: Instant,
 }
 
 pub(super) struct Term {
@@ -178,6 +195,8 @@ pub(super) struct Term {
     vi_mode: bool,
     cursor_blinking: StdCell<bool>,
     events: EventSink,
+    key_encoder: KeyEncoder<'static>,
+    key_event: KeyEvent<'static>,
 }
 
 /// The selection as Zed last set it; libghostty keeps its own copy in grid coordinates.
@@ -251,8 +270,17 @@ pub(super) fn set_default_cursor_style(config: &mut TermConfig, cursor_shape: Se
 pub(super) fn apply_config(term: &TermLock, config: &TermConfig) {
     let mut term = term.lock();
     term.config = config.clone();
+    set_scrollback_limit(&mut term.terminal, config.scrolling_history);
     // Applies at the next DECSCUSR reset, so a style the program chose is kept.
     apply_cursor_style(&mut term.terminal, config.cursor_shape);
+}
+
+/// Limits history by lines only; libghostty's default byte limit keeps a few hundred lines.
+fn set_scrollback_limit(terminal: &mut GhosttyTerminal, lines: usize) {
+    terminal
+        .set_scrollback_max_bytes(None)
+        .and_then(|terminal| terminal.set_scrollback_max_lines(Some(lines)))
+        .expect("set scrollback limit");
 }
 
 /// Gives libghostty the theme's colors, which it reports to programs that ask.
@@ -291,13 +319,6 @@ fn write_from_ground(terminal: &mut GhosttyTerminal<'static, 'static>, bytes: &[
         terminal.vt_write(b"\x18");
     }
     terminal.vt_write(bytes);
-}
-
-/// Matches libghostty's reply to a kitty keyboard protocol query (`CSI ? flags u`).
-fn is_kitty_keyboard_reply(data: &[u8]) -> bool {
-    data.strip_prefix(b"\x1b[?")
-        .and_then(|rest| rest.strip_suffix(b"u"))
-        .is_some_and(|flags| !flags.is_empty() && flags.iter().all(u8::is_ascii_digit))
 }
 
 fn apply_cursor_style(
@@ -339,11 +360,14 @@ pub(super) fn new_term(
     };
     let (columns, rows) = grid_size(bounds);
     let mut terminal = GhosttyTerminal::new(columns, rows).expect("create libghostty terminal");
-    terminal
-        .set_scrollback_max_lines(Some(config.scrolling_history))
-        .expect("set scrollback limit");
+    set_scrollback_limit(&mut terminal, config.scrolling_history);
     apply_cursor_style(&mut terminal, config.cursor_shape);
     terminal.vt_write(RESET_CURSOR_STYLE);
+    // Size multi-codepoint characters, such as flags and emoji sequences, as
+    // one grapheme cluster, like Ghostty does by default.
+    terminal
+        .set_default_mode(Mode::GRAPHEME_CLUSTER, true)
+        .expect("enable grapheme clustering");
     if let AlternateScroll::Off = alternate_scroll {
         terminal
             .set_default_mode(Mode::ALT_SCROLL, false)
@@ -353,13 +377,9 @@ pub(super) fn new_term(
     let sink = events.clone();
     terminal
         .on_pty_write(move |_, data| {
-            // Zed encodes keys the legacy way, so programs must not think the
-            // kitty keyboard protocol is available.
-            if !is_kitty_keyboard_reply(data) {
-                sink.send(TerminalBackendEvent::PtyWrite(
-                    String::from_utf8_lossy(data).into_owned(),
-                ))
-            }
+            sink.send(TerminalBackendEvent::PtyWrite(
+                String::from_utf8_lossy(data).into_owned(),
+            ))
         })
         .expect("register pty write callback");
     let renderer = Rc::new(RefCell::new(Renderer::new()));
@@ -367,11 +387,10 @@ pub(super) fn new_term(
     terminal
         .on_render_hold(move |terminal, held| {
             let mut renderer = hold_renderer.borrow_mut();
-            let frame = held.then(|| renderer.frame(terminal));
-            renderer.held = frame.map(|frame| HeldFrame {
-                frame,
-                since: Instant::now(),
-            });
+            if held && renderer.shown_since_refresh {
+                renderer.refresh(terminal);
+            }
+            renderer.held_since = held.then(Instant::now);
         })
         .expect("register render hold callback");
     let sink = events.clone();
@@ -443,6 +462,8 @@ pub(super) fn new_term(
         vi_mode: false,
         cursor_blinking: StdCell::new(false),
         events,
+        key_encoder: KeyEncoder::new().expect("create key encoder"),
+        key_event: KeyEvent::new().expect("create key event"),
     };
     resize(&mut term, bounds);
     Arc::new(TermLock(Mutex::new(term)))
@@ -589,6 +610,8 @@ pub(super) fn spawn_event_loop(
         receiver,
         drain_on_exit,
         pending_writes: Default::default(),
+        compression_activity: None,
+        compression_due: None,
     };
     std::thread::Builder::new()
         .name("terminal pty io".into())
@@ -605,6 +628,10 @@ struct IoLoop {
     receiver: Receiver<Msg>,
     drain_on_exit: bool,
     pending_writes: std::collections::VecDeque<(Cow<'static, [u8]>, usize)>,
+    /// The terminal's compression activity when it was last checked.
+    compression_activity: Option<CompressionActivity>,
+    /// When to take the next compression step.
+    compression_due: Option<Instant>,
 }
 
 impl IoLoop {
@@ -619,17 +646,14 @@ impl IoLoop {
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut events = Events::with_capacity(NonZeroUsize::new(64).unwrap());
         'io: loop {
-            let hold_time_left = self.term.lock().renderer.borrow().hold_time_left();
+            let timeout = self.run_timers();
             events.clear();
-            if let Err(error) = self.poller.wait(&mut events, hold_time_left) {
+            if let Err(error) = self.poller.wait(&mut events, timeout) {
                 if error.kind() == ErrorKind::Interrupted {
                     continue;
                 }
                 log::error!("pty poll failed: {error}");
                 break;
-            }
-            if expire_render_hold(&mut self.term.lock()) {
-                self.events.send(TerminalBackendEvent::Wakeup);
             }
 
             if !self.drain_messages() {
@@ -688,6 +712,40 @@ impl IoLoop {
             }
         }
         self.pty.deregister(&self.poller).ok();
+    }
+
+    /// Ends an expired render hold and compresses scrollback once output pauses.
+    /// Returns how long the poller may wait before this is due again.
+    fn run_timers(&mut self) -> Option<Duration> {
+        let mut term = self.term.lock();
+        if expire_render_hold(&mut term) {
+            self.events.send(TerminalBackendEvent::Wakeup);
+        }
+
+        let now = Instant::now();
+        let activity = term
+            .terminal
+            .compression_activity()
+            .expect("read compression activity");
+        if self.compression_activity != Some(activity) {
+            self.compression_activity = Some(activity);
+            self.compression_due = Some(now + COMPRESSION_IDLE);
+        } else if self.compression_due.is_some_and(|due| due <= now) {
+            let result = term
+                .terminal
+                .compress(CompressionMode::Incremental)
+                .expect("compress scrollback");
+            self.compression_due = match result {
+                CompressionResult::Pending => Some(now + COMPRESSION_STEP),
+                CompressionResult::Complete | CompressionResult::Unsupported => None,
+            };
+        }
+
+        let compression_wait = self
+            .compression_due
+            .map(|due| due.saturating_duration_since(now));
+        let hold_wait = term.renderer.borrow().hold_time_left();
+        compression_wait.into_iter().chain(hold_wait).min()
     }
 
     /// Returns false on shutdown.
@@ -1128,6 +1186,160 @@ fn selection_range(term: &Term) -> Option<SelectionRange> {
     })
 }
 
+// --- Keyboard ---
+
+/// Encodes a key press for the program: the legacy way, or with the kitty
+/// keyboard protocol once the program enables it. Returns `None` when the key
+/// only types its text, which arrives through text input instead.
+///
+/// Only key presses are reported, even when the program asks for releases.
+pub(super) fn encode_key(
+    term: &TermLock,
+    keystroke: &Keystroke,
+    mode: Modes,
+    option_as_meta: bool,
+) -> Option<Cow<'static, str>> {
+    let mut term = term.lock();
+    let flags = term
+        .terminal
+        .kitty_keyboard_flags()
+        .expect("read kitty keyboard flags");
+    if flags.is_empty() {
+        return to_esc_str(keystroke, mode, option_as_meta);
+    }
+
+    let modifiers = keystroke.modifiers;
+    let mut mods = KeyMods::empty();
+    mods.set(KeyMods::SHIFT, modifiers.shift);
+    mods.set(KeyMods::ALT, modifiers.alt);
+    mods.set(KeyMods::CTRL, modifiers.control);
+    mods.set(KeyMods::SUPER, modifiers.platform);
+    // macOS reports tab and enter as text too; the encoder wants printable text only.
+    let text = keystroke
+        .key_char
+        .as_deref()
+        .filter(|text| !text.chars().any(char::is_control));
+    let base_key = if keystroke.key == "space" {
+        Some(' ')
+    } else {
+        single_char(&keystroke.key)
+    };
+    let binding_modifier = modifiers.control || modifiers.alt || modifiers.platform;
+    if text.is_none() && !binding_modifier && base_key.is_some() {
+        // A printable key without text is part of a dead key or compose sequence.
+        return None;
+    }
+    let unshifted = text
+        .and_then(single_char)
+        .and_then(|typed| unshifted_char(typed, modifiers.shift))
+        .or(base_key);
+    let mut consumed = KeyMods::empty();
+    if text.is_some() {
+        consumed.set(KeyMods::SHIFT, modifiers.shift);
+        // macOS types characters with Option unless it is used as Meta.
+        consumed.set(
+            KeyMods::ALT,
+            cfg!(target_os = "macos") && modifiers.alt && !option_as_meta,
+        );
+    }
+    let term = &mut *term;
+    term.key_event
+        .set_action(KeyAction::Press)
+        .set_key(physical_key(&keystroke.key))
+        .set_mods(mods)
+        .set_consumed_mods(consumed)
+        .set_utf8(text)
+        .set_unshifted_codepoint(unshifted.unwrap_or('\0'));
+    term.key_encoder
+        .set_options_from_terminal(&term.terminal)
+        .set_macos_option_as_alt(if option_as_meta {
+            OptionAsAlt::True
+        } else {
+            OptionAsAlt::False
+        });
+    let mut encoded = Vec::new();
+    term.key_encoder
+        .encode_to_vec(&term.key_event, &mut encoded)
+        .expect("encode key");
+    if encoded.is_empty() {
+        // Keys libghostty can't identify, such as some keypad keys.
+        return to_esc_str(keystroke, mode, option_as_meta);
+    }
+    let types_text = text.is_some_and(|text| text.as_bytes() == encoded)
+        && !(modifiers.control || modifiers.platform)
+        && (!modifiers.alt || consumed.contains(KeyMods::ALT));
+    if types_text {
+        return None;
+    }
+    Some(Cow::Owned(
+        String::from_utf8(encoded).expect("key encodings are UTF-8"),
+    ))
+}
+
+/// The character the key types without shift or caps lock, when the typed
+/// character tells. GPUI names the US key at the pressed position, so on
+/// other layouts the typed character is the only source of the layout's own.
+fn unshifted_char(typed: char, shift: bool) -> Option<char> {
+    let lower = single_char(&typed.to_lowercase().to_string());
+    match lower {
+        Some(lower) if lower != typed => Some(lower),
+        // Shift without a case change: the key's name is the best guess, though
+        // GPUI names some shifted symbols, such as "!", by the symbol.
+        _ if shift => None,
+        _ => Some(typed),
+    }
+}
+
+fn single_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    chars.next().filter(|_| chars.next().is_none())
+}
+
+/// The US-layout key for a GPUI key name. Keys without one are identified by
+/// their character alone.
+fn physical_key(key: &str) -> Key {
+    // Letters, digits and function keys are numbered consecutively.
+    let offset = |first: Key, offset: u32| {
+        Key::try_from(first as i32 + offset as i32).expect("key numbering is consecutive")
+    };
+    match key {
+        "space" => Key::Space,
+        "enter" => Key::Enter,
+        "tab" => Key::Tab,
+        "backspace" => Key::Backspace,
+        "escape" => Key::Escape,
+        "insert" => Key::Insert,
+        "delete" => Key::Delete,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "up" => Key::ArrowUp,
+        "down" => Key::ArrowDown,
+        "left" => Key::ArrowLeft,
+        "right" => Key::ArrowRight,
+        "`" => Key::Backquote,
+        "\\" => Key::Backslash,
+        "[" => Key::BracketLeft,
+        "]" => Key::BracketRight,
+        "," => Key::Comma,
+        "=" => Key::Equal,
+        "-" => Key::Minus,
+        "." => Key::Period,
+        "'" => Key::Quote,
+        ";" => Key::Semicolon,
+        "/" => Key::Slash,
+        _ => match single_char(key) {
+            Some(letter @ 'a'..='z') => offset(Key::A, letter as u32 - 'a' as u32),
+            Some(digit @ '0'..='9') => offset(Key::Digit0, digit as u32 - '0' as u32),
+            _ => match key.strip_prefix('f').map(str::parse::<u32>) {
+                Some(Ok(number @ 1..=24)) => offset(Key::F1, number - 1),
+                _ => Key::Unidentified,
+            },
+        },
+    }
+}
+
 // --- Vi mode (not supported by this backend yet) ---
 
 pub(super) fn toggle_vi_mode(term: &mut Term) {
@@ -1222,10 +1434,10 @@ fn indexed_color(index: u8) -> Color {
 /// Ends a render hold the program kept past the timeout. Returns whether it did.
 fn expire_render_hold(term: &mut Term) -> bool {
     let mut renderer = term.renderer.borrow_mut();
-    if renderer.held.is_none() || renderer.hold_time_left().is_some() {
+    if renderer.held_since.is_none() || renderer.hold_time_left().is_some() {
         return false;
     }
-    renderer.held = None;
+    renderer.held_since = None;
     drop(renderer);
     // Lets the program's next hold start a new one.
     term.terminal
@@ -1241,29 +1453,36 @@ impl Renderer {
             rows: RowIterator::new().expect("create row iterator"),
             cells: CellIterator::new().expect("create cell iterator"),
             row_cells: Vec::new(),
-            held: None,
+            display_offset: 0,
+            cursor: Cursor {
+                shape: CursorShape::Block,
+                point: Point::new(0, 0),
+            },
+            cursor_blinking: false,
+            held_since: None,
+            shown_since_refresh: true,
         }
     }
 
-    /// The frame to show: the held one during a render hold, otherwise the live screen.
+    /// The frame to show: the live screen, or during a render hold the last frame shown.
     fn display_frame(&mut self, terminal: &GhosttyTerminal<'static, 'static>) -> Frame {
         if self.hold_time_left().is_none() {
-            self.held = None;
+            self.held_since = None;
+            self.refresh(terminal);
         }
-        match &self.held {
-            Some(held) => held.frame.clone(),
-            None => self.frame(terminal),
-        }
+        self.shown_since_refresh = true;
+        self.frame()
     }
 
     /// Time left before the current render hold is ignored; `None` without one or once it has expired.
     fn hold_time_left(&self) -> Option<Duration> {
-        RENDER_HOLD_TIMEOUT.checked_sub(self.held.as_ref()?.since.elapsed())
+        RENDER_HOLD_TIMEOUT.checked_sub(self.held_since?.elapsed())
     }
 
-    /// Copies the visible screen out of the terminal.
-    fn frame(&mut self, terminal: &GhosttyTerminal<'static, 'static>) -> Frame {
-        let display_offset = viewport_offset(terminal);
+    /// Copies the visible screen's changed rows and the cursor out of the terminal.
+    fn refresh(&mut self, terminal: &GhosttyTerminal<'static, 'static>) {
+        self.shown_since_refresh = false;
+        self.display_offset = viewport_offset(terminal);
         let Self {
             state,
             rows,
@@ -1297,21 +1516,6 @@ impl Renderer {
         }
         snapshot.clean().expect("mark render state clean");
 
-        let cells = row_cells
-            .iter()
-            .enumerate()
-            .flat_map(|(row, (_, cells))| {
-                let line = row as i32 - display_offset as i32;
-                cells
-                    .iter()
-                    .enumerate()
-                    .map(move |(column, cell)| IndexedCell {
-                        point: Point::new(line, column),
-                        cell: Cell { cell: cell.clone() },
-                    })
-            })
-            .collect();
-
         let shape = if !cursor_state.visible {
             CursorShape::Hidden
         } else {
@@ -1333,11 +1537,58 @@ impl Renderer {
         {
             point.column -= 1;
         }
+        self.cursor = Cursor { shape, point };
+        self.cursor_blinking = cursor_state.blinking;
+    }
+
+    fn frame(&self) -> Frame {
+        let display_offset = self.display_offset;
+        let cells = self
+            .row_cells
+            .iter()
+            .enumerate()
+            .flat_map(|(row, (_, cells))| {
+                let line = row as i32 - display_offset as i32;
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, cell)| IndexedCell {
+                        point: Point::new(line, column),
+                        cell: Cell { cell: cell.clone() },
+                    })
+            })
+            .collect();
         Frame {
             cells,
             display_offset,
-            cursor: Cursor { shape, point },
-            cursor_blinking: cursor_state.blinking,
+            cursor: self.cursor,
+            cursor_blinking: self.cursor_blinking,
+        }
+    }
+}
+
+/// The parts of a libghostty style that Zed draws.
+#[derive(Clone, Copy)]
+struct CellStyle {
+    fg: Color,
+    bg: Color,
+    flags: CellFlags,
+}
+
+impl CellStyle {
+    fn new(style: Style) -> Self {
+        let mut flags = CellFlags::default();
+        flags.set(CellFlags::INVERSE, style.inverse);
+        flags.set(CellFlags::DIM, style.faint);
+        flags.set(CellFlags::UNDERLINE, style.underline != Underline::None);
+        flags.set(CellFlags::UNDERCURL, style.underline == Underline::Curly);
+        flags.set(CellFlags::STRIKEOUT, style.strikethrough);
+        flags.set(CellFlags::BOLD, style.bold);
+        flags.set(CellFlags::ITALIC, style.italic);
+        Self {
+            fg: zed_color(style.fg_color, NamedColor::Foreground),
+            bg: zed_color(style.bg_color, NamedColor::Background),
+            flags,
         }
     }
 }
@@ -1351,51 +1602,68 @@ fn read_row(
 ) -> Vec<CellData> {
     let mut output = Vec::new();
     let mut graphemes = Vec::new();
+    // Style ids are only unique within a page, and a row never spans pages.
+    let mut styles: Vec<(StyleId, CellStyle)> = Vec::new();
     let mut cell_iteration = cells.update(row).expect("iterate cells");
     let mut column = 0;
     while let Some(cell) = cell_iteration.next() {
         let raw = cell.raw_cell().expect("read cell");
-        let style = cell.style().expect("read cell style");
-        let mut data = CellData {
-            fg: zed_color(style.fg_color, NamedColor::Foreground),
-            bg: match raw.content_tag().expect("read cell content") {
-                CellContentTag::BgColorPalette => {
-                    indexed_color(raw.bg_color_palette().expect("read cell background").0)
+        let content = raw.content_tag().expect("read cell content");
+        let mut data = CellData::default();
+        match content {
+            CellContentTag::Codepoint => match raw.codepoint().expect("read codepoint") {
+                0 => {}
+                codepoint => {
+                    data.character = char::from_u32(codepoint).expect("cells hold valid codepoints")
                 }
-                CellContentTag::BgColorRgb => {
-                    let rgb = raw.bg_color_rgb().expect("read cell background");
-                    Color::Spec(Rgb {
-                        r: rgb.r,
-                        g: rgb.g,
-                        b: rgb.b,
-                    })
-                }
-                _ => zed_color(style.bg_color, NamedColor::Background),
             },
-            ..CellData::default()
-        };
-
-        graphemes.resize(cell.graphemes_len().expect("read graphemes") as usize, ' ');
-        cell.graphemes_buf(&mut graphemes).expect("read graphemes");
-        if let Some((&first, rest)) = graphemes.split_first() {
-            data.character = first;
-            if !rest.is_empty() {
-                data.zerowidth = Some(Arc::from(rest));
+            CellContentTag::CodepointGrapheme => {
+                graphemes.resize(cell.graphemes_len().expect("read graphemes") as usize, ' ');
+                cell.graphemes_buf(&mut graphemes).expect("read graphemes");
+                if let Some((&first, rest)) = graphemes.split_first() {
+                    data.character = first;
+                    if !rest.is_empty() {
+                        data.zerowidth = Some(Arc::from(rest));
+                    }
+                }
+            }
+            CellContentTag::BgColorPalette => {
+                data.bg = indexed_color(raw.bg_color_palette().expect("read cell background").0);
+            }
+            CellContentTag::BgColorRgb => {
+                let rgb = raw.bg_color_rgb().expect("read cell background");
+                data.bg = Color::Spec(Rgb {
+                    r: rgb.r,
+                    g: rgb.g,
+                    b: rgb.b,
+                });
             }
         }
-
-        let flags = &mut data.flags;
-        flags.set(CellFlags::INVERSE, style.inverse);
-        flags.set(
+        data.flags.set(
             CellFlags::WIDE_CHAR_SPACER,
             raw.wide().expect("read cell width") == CellWide::SpacerTail,
         );
-        flags.set(CellFlags::DIM, style.faint);
-        flags.set(CellFlags::UNDERLINE, style.underline != Underline::None);
-        flags.set(CellFlags::UNDERCURL, style.underline == Underline::Curly);
-        flags.set(CellFlags::STRIKEOUT, style.strikethrough);
-        flags.set(CellFlags::BOLD, style.bold);
-        flags.set(CellFlags::ITALIC, style.italic);
+
+        // Most cells use the default style, which needs no lookup.
+        if raw.has_styling().expect("read cell styling") {
+            let id = raw.style_id().expect("read cell style id");
+            let style = match styles.iter().find(|(cached, _)| *cached == id) {
+                Some((_, style)) => *style,
+                None => {
+                    let style = CellStyle::new(cell.style().expect("read cell style"));
+                    styles.push((id, style));
+                    style
+                }
+            };
+            data.fg = style.fg;
+            if matches!(
+                content,
+                CellContentTag::Codepoint | CellContentTag::CodepointGrapheme
+            ) {
+                data.bg = style.bg;
+            }
+            data.flags.0 |= style.flags.0;
+        }
 
         if raw.has_hyperlink().expect("read cell hyperlink") {
             let grid_ref = terminal
@@ -1539,7 +1807,7 @@ pub(super) fn clear_saved_screen(term: &mut Term) {
     write_from_ground(&mut term.terminal, sequence.as_bytes());
 }
 
-/// Not supported by this backend yet: the scrollback keeps its size.
+/// libghostty allocates history as it grows, so there is no unused space to free.
 pub(super) fn shrink_to_used(_term: &mut Term) {}
 
 /// Appends a stringified task summary to the terminal, after its output.
@@ -1557,19 +1825,48 @@ pub(super) unsafe fn append_text_to_term(term: &mut Term, text_lines: &[&str]) {
 
 // --- Search and hyperlinks ---
 
+/// libghostty matches literal text, ignoring the case of ASCII letters.
 impl Search {
-    pub fn new(search: &str) -> Option<Self> {
+    pub const SUPPORTS_REGEX: bool = false;
+
+    pub fn new(_regex: &str) -> Option<Self> {
+        None
+    }
+
+    pub fn literal(text: &str) -> Option<Self> {
         Some(Self {
             search: SearchData {
-                regex: regex::Regex::new(search).ok()?,
+                needle: text.to_owned(),
             },
         })
     }
 }
 
-/// Not supported by this backend yet.
-pub(super) fn search_matches(_term: &Term, _searcher: Search) -> Vec<Range> {
-    Vec::new()
+/// Matches on the active screen, scrollback included, from oldest to newest.
+pub(super) fn search_matches(term: &mut Term, searcher: Search) -> Vec<Range> {
+    let history = history_rows(term) as i32;
+    let terminal = &mut term.terminal;
+    let mut search = GhosttySearch::new(terminal).expect("create search");
+    search
+        .set_needle(terminal, searcher.search.needle.as_bytes())
+        .expect("set search needle");
+    search.run(terminal).expect("run search");
+    let snapshot = search.snapshot(terminal).expect("read search matches");
+    let point = |grid_ref| {
+        let coordinate = snapshot
+            .terminal()
+            .point_from_grid_ref(&grid_ref, PointSpace::Screen)
+            .expect("resolve match point")
+            .expect("match is on the active screen");
+        Point::new(coordinate.y as i32 - history, usize::from(coordinate.x))
+    };
+    let mut storage = MatchBuffer::new();
+    snapshot
+        .matches(&mut storage)
+        .expect("read search matches")
+        .rev()
+        .map(|found| Range::new(point(found.start()), point(found.end())))
+        .collect()
 }
 
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://|zed://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`']+"#;
@@ -1973,13 +2270,6 @@ impl Cell {
         self.cell.zerowidth.as_deref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_zerowidth(&mut self, character: char) {
-        let mut chars = self.cell.zerowidth.as_deref().unwrap_or_default().to_vec();
-        chars.push(character);
-        self.cell.zerowidth = Some(Arc::from(chars));
-    }
-
     #[inline]
     pub fn hyperlink(&self) -> Option<Hyperlink> {
         self.cell.hyperlink.clone()
@@ -2105,15 +2395,48 @@ mod tests {
     }
 
     #[test]
-    fn does_not_answer_kitty_keyboard_queries() {
+    fn encodes_keys_with_the_kitty_protocol_once_enabled() {
         let (term, mut events) = test_term(SettingsCursorShape::Block);
-        term.lock().terminal.vt_write(b"\x1b[?u\x1b[c");
-        let mut replies = Vec::new();
-        while let Ok(PtyEvent::Event(TerminalBackendEvent::PtyWrite(reply), _)) = events.try_recv()
-        {
-            replies.push(reply);
+        fn encode(term: &TermLock, keystroke: &'static str, text: Option<&str>) -> Option<String> {
+            let mut keystroke = Keystroke::parse(keystroke).unwrap();
+            keystroke.key_char = text.map(str::to_owned);
+            let mode = modes(&term.lock());
+            encode_key(term, &keystroke, mode, false).map(Cow::into_owned)
         }
-        assert_eq!(replies, ["\x1b[?62;1;6;22c"]);
+        assert_eq!(encode(&term, "shift-enter", None), Some("\x0a".into()));
+
+        term.lock().terminal.vt_write(b"\x1b[>1u\x1b[?u");
+        let Ok(PtyEvent::Event(TerminalBackendEvent::PtyWrite(reply), _)) = events.try_recv()
+        else {
+            panic!("expected a kitty keyboard reply");
+        };
+        assert_eq!(reply, "\x1b[?1u");
+        assert_eq!(
+            encode(&term, "shift-enter", None),
+            Some("\x1b[13;2u".into())
+        );
+        assert_eq!(encode(&term, "ctrl-i", None), Some("\x1b[105;5u".into()));
+        assert_eq!(encode(&term, "tab", Some("\t")), Some("\t".into()));
+        assert_eq!(encode(&term, "escape", None), Some("\x1b[27u".into()));
+        assert_eq!(encode(&term, "f5", None), Some("\x1b[15~".into()));
+        assert_eq!(encode(&term, "ctrl-space", None), Some("\x1b[32;5u".into()));
+        assert_eq!(
+            encode(&term, "alt-space", Some(" ")),
+            Some("\x1b[32;3u".into())
+        );
+        // Typed text arrives through text input, also with shift or caps lock.
+        assert_eq!(encode(&term, "a", Some("a")), None);
+        assert_eq!(encode(&term, "shift-a", Some("A")), None);
+        assert_eq!(encode(&term, "shift-a", Some("a")), None);
+        assert_eq!(encode(&term, "!", Some("!")), None);
+        // Dead keys and compose sequences type their text later.
+        assert_eq!(encode(&term, "'", None), None);
+        // On an Icelandic layout GPUI names the æ key after the US ";" key.
+        assert_eq!(encode(&term, ";", Some("æ")), None);
+        assert_eq!(
+            encode(&term, "alt-;", Some("æ")),
+            Some("\x1b[230;3u".into())
+        );
     }
 
     #[test]
@@ -2124,6 +2447,19 @@ mod tests {
         assert_eq!(line_text(&live_frame(&term), 0), "before");
         term.terminal.vt_write(b"\x1b[?2026l");
         assert_eq!(line_text(&live_frame(&term), 0), "after");
+    }
+
+    #[test]
+    fn shows_frames_a_program_draws_back_to_back() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal
+            .vt_write(b"\x1b[?2026hone\x1b[?2026l\x1b[?2026h\rtwo\x1b[?2026l\x1b[?2026h\r");
+        live_frame(&term);
+        // The next hold starts after a shown frame, so it shows the frame finished before it.
+        term.terminal
+            .vt_write(b"three\x1b[?2026l\x1b[?2026h\rfour\x1b[?2026l\x1b[?2026h\r");
+        assert_eq!(line_text(&live_frame(&term), 0), "three");
     }
 
     #[test]
@@ -2231,5 +2567,60 @@ mod tests {
         term.terminal.vt_write(b"\x1b[?1049h");
         update_selection(&mut term, Point::new(0, 1), SelectionSide::Right);
         assert_eq!(selection_text(&term), None);
+    }
+
+    #[test]
+    fn keeps_the_configured_number_of_history_lines() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        apply_config(&term, &pty_term_config(5_000, SettingsCursorShape::Block));
+        let mut term = term.lock();
+        for line in 0..2_000 {
+            term.terminal.vt_write(format!("{line}\r\n").as_bytes());
+        }
+        assert_eq!(history_size(&term), 1_998);
+    }
+
+    #[test]
+    fn compressing_scrollback_keeps_its_text_and_settles() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        apply_config(&term, &pty_term_config(10_000, SettingsCursorShape::Block));
+        let mut term = term.lock();
+        for line in 0..5_000 {
+            term.terminal
+                .vt_write(format!("line {line}\r\n").as_bytes());
+        }
+        let text = content_text(&term);
+        let activity = term.terminal.compression_activity().unwrap();
+        while term
+            .terminal
+            .compress(CompressionMode::Incremental)
+            .unwrap()
+            == CompressionResult::Pending
+        {}
+        // The IO loop schedules compression when this changes, so compressing must not change it.
+        assert_eq!(term.terminal.compression_activity().unwrap(), activity);
+        assert_eq!(content_text(&term), text);
+    }
+
+    #[test]
+    fn search_finds_literal_text_in_scrollback_from_oldest_to_newest() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal
+            .vt_write(b"Foo one\r\nf.o\r\nfoo two\r\nbaz\r\nqux");
+        let found = |term: &mut Term, needle| {
+            search_matches(term, Search::literal(needle).expect("literal search"))
+        };
+        assert_eq!(
+            found(&mut term, "foo"),
+            vec![
+                Range::new(Point::new(-2, 0), Point::new(-2, 2)),
+                Range::new(Point::new(0, 0), Point::new(0, 2)),
+            ]
+        );
+        assert_eq!(
+            found(&mut term, "f.o"),
+            vec![Range::new(Point::new(-1, 0), Point::new(-1, 2))]
+        );
     }
 }

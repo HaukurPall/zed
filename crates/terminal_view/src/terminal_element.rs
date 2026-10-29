@@ -503,6 +503,8 @@ impl TerminalElement {
                 }
                 // Skip wide character spacers - they're just placeholders for the second cell of wide characters
                 if cell.is_wide_char_spacer() {
+                    // The character already covers two cells, so a space after it is real.
+                    previous_cell_had_extras = false;
                     continue;
                 }
 
