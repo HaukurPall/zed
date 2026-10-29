@@ -89,12 +89,14 @@ use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::Event as TerminalEvent;
 #[cfg(any(test, feature = "test-support"))]
 use terminal::terminal_settings::TerminalSettings;
+use terminal::{ProgramState, ProgressState, TerminalStatus};
 use terminal_view::TerminalView;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -181,6 +183,8 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    /// What the program in the terminal reports about its work.
+    pub status: AgentThreadStatus,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -967,6 +971,24 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Shows what a terminal's program reports like the status of an agent thread.
+fn terminal_thread_status(status: Option<TerminalStatus>) -> AgentThreadStatus {
+    match status {
+        Some(TerminalStatus::Program(record)) => match record.state {
+            ProgramState::Working => AgentThreadStatus::Running,
+            ProgramState::Blocked => AgentThreadStatus::WaitingForConfirmation,
+            ProgramState::Error => AgentThreadStatus::Error,
+            ProgramState::Done | ProgramState::Idle => AgentThreadStatus::Completed,
+        },
+        Some(TerminalStatus::Progress(progress)) => match progress.state {
+            ProgressState::Normal | ProgressState::Indeterminate => AgentThreadStatus::Running,
+            ProgressState::Error => AgentThreadStatus::Error,
+            ProgressState::Paused => AgentThreadStatus::Completed,
+        },
+        None => AgentThreadStatus::Completed,
+    }
 }
 
 impl AgentTerminal {
@@ -2255,8 +2277,8 @@ impl AgentPanel {
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
+                TerminalEvent::StatusChanged => cx.emit(AgentPanelEvent::EntryChanged),
                 TerminalEvent::BlinkChanged(_)
-                | TerminalEvent::StatusChanged
                 | TerminalEvent::OutputReplaced
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
@@ -3442,6 +3464,7 @@ impl AgentPanel {
                 has_notification: terminal.has_notification,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
+                status: terminal_thread_status(terminal.view.read(cx).terminal().read(cx).status()),
             })
             .collect()
     }
@@ -10998,6 +11021,44 @@ mod tests {
                 .find(|terminal| terminal.id == first_terminal_id)
                 .expect("first terminal should remain in the panel");
             assert!(!first_terminal.has_notification);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_status_change_updates_entries(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Claude", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        let entry_changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update({
+            let entry_changes = entry_changes.clone();
+            let panel = panel.clone();
+            move |_, cx| {
+                cx.subscribe(&panel, move |_, event: &AgentPanelEvent, _| {
+                    if matches!(event, AgentPanelEvent::EntryChanged) {
+                        entry_changes.set(entry_changes.get() + 1);
+                    }
+                })
+            }
+        });
+        panel.update(&mut cx, |panel, cx| {
+            panel.emit_test_terminal_event(terminal_id, TerminalEvent::StatusChanged, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(entry_changes.get(), 1);
+        panel.read_with(&cx, |panel, cx| {
+            let terminal = panel
+                .terminals(cx)
+                .into_iter()
+                .find(|terminal| terminal.id == terminal_id)
+                .expect("terminal should remain in the panel");
+            assert_eq!(terminal.status, AgentThreadStatus::Completed);
         });
     }
 
