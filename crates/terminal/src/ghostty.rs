@@ -14,7 +14,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Once,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     time::{Duration, Instant},
@@ -25,16 +25,22 @@ use alacritty_terminal::{
     tty::{self, EventedPty, EventedReadWrite},
 };
 use anyhow::{Context as _, Result};
+use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
-use gpui::Keystroke;
+use gpui::{Bounds, Keystroke, RenderImage, point, size};
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
+    alloc::{Allocator, Bytes},
     key::{
         Action as KeyAction, Encoder as KeyEncoder, Event as KeyEvent, Key, Mods as KeyMods,
         OptionAsAlt,
     },
+    kitty::graphics::{
+        self, DecodePng, DecodedImage, Image as KittyImage, ImageFormat as KittyImageFormat,
+    },
     render::{
-        CellIterator, CursorVisualStyle, Dirty, RenderState, RowId, RowIteration, RowIterator,
+        CellIterator, CursorVisualStyle, Dirty, ImageIterator, ImageLayer, ImageProtocol,
+        RenderState, RowId, RowIteration, RowIterator, Snapshot,
     },
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     search::{MatchBuffer, Search as GhosttySearch},
@@ -56,8 +62,8 @@ use vte::ansi::{Color, NamedColor, Rgb};
 use crate::{
     Cell, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionAnchor, SelectionRange,
-    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
-    adjusted_last_hovered_word, get_color_at_index,
+    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, TerminalImage,
+    TerminalImageLayer, ViMotion, adjusted_last_hovered_word, get_color_at_index,
     mappings::{colors::to_vte_rgb, keys::to_esc_str},
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
@@ -147,6 +153,9 @@ pub(super) type GridIter<'a> = Box<dyn Iterator<Item = IndexedCell> + 'a>;
 /// How long a program may hold the screen before its updates are shown anyway.
 const RENDER_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Memory for kitty graphics images per screen, Ghostty's default.
+const KITTY_IMAGE_STORAGE_LIMIT: u64 = 320_000_000;
+
 /// Output-free time before scrollback compression starts, as in Ghostty.
 const COMPRESSION_IDLE: Duration = Duration::from_millis(250);
 
@@ -170,6 +179,12 @@ struct Renderer {
     /// When the running program began holding back its updates. Until it
     /// ends, the rows copied at the last refresh keep being shown.
     held_since: Option<Instant>,
+    images: ImageIterator<'static>,
+    /// The render state's image placements generation as of `placements`.
+    placements_generation: Option<u64>,
+    placements: Vec<TerminalImage>,
+    /// Pixels of the images in `placements`, by image id and generation.
+    textures: HashMap<(u32, u64), Arc<RenderImage>>,
     /// Whether a frame was shown since the last refresh. A hold that starts
     /// then refreshes first, so a program that draws back to back still has
     /// its latest complete frame shown, at most once per frame Zed draws.
@@ -182,6 +197,7 @@ struct Frame {
     display_offset: usize,
     cursor: Cursor,
     cursor_blinking: bool,
+    images: Vec<TerminalImage>,
 }
 
 pub(super) struct Term {
@@ -354,6 +370,14 @@ pub(super) fn new_term(
     alternate_scroll: AlternateScroll,
     generation: u64,
 ) -> Arc<TermLock> {
+    // Other terminals wait here until the decoder is installed, so this runs
+    // before any libghostty call.
+    static PNG_DECODER: Once = Once::new();
+    PNG_DECODER.call_once(|| {
+        // SAFETY: no other thread uses libghostty before the first terminal exists.
+        unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }
+            .expect("install PNG decoder");
+    });
     let events = EventSink {
         sender: events_tx,
         generation,
@@ -361,6 +385,9 @@ pub(super) fn new_term(
     let (columns, rows) = grid_size(bounds);
     let mut terminal = GhosttyTerminal::new(columns, rows).expect("create libghostty terminal");
     set_scrollback_limit(&mut terminal, config.scrolling_history);
+    terminal
+        .set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_LIMIT)
+        .expect("enable kitty graphics");
     apply_cursor_style(&mut terminal, config.cursor_shape);
     terminal.vt_write(RESET_CURSOR_STYLE);
     // Size multi-codepoint characters, such as flags and emoji sequences, as
@@ -1461,6 +1488,10 @@ impl Renderer {
             cursor_blinking: false,
             held_since: None,
             shown_since_refresh: true,
+            images: ImageIterator::new().expect("create image iterator"),
+            placements_generation: None,
+            placements: Vec::new(),
+            textures: HashMap::default(),
         }
     }
 
@@ -1514,6 +1545,14 @@ impl Renderer {
             }
             row_cells.truncate(viewport_row);
         }
+        let placements_generation = snapshot
+            .image_placements_generation()
+            .expect("read image placements generation");
+        if self.placements_generation != Some(placements_generation) {
+            self.placements_generation = Some(placements_generation);
+            self.placements =
+                read_images(terminal, &snapshot, &mut self.images, &mut self.textures);
+        }
         snapshot.clean().expect("mark render state clean");
 
         let shape = if !cursor_state.visible {
@@ -1563,7 +1602,162 @@ impl Renderer {
             display_offset,
             cursor: self.cursor,
             cursor_blinking: self.cursor_blinking,
+            images: self.placements.clone(),
         }
+    }
+}
+
+/// Lists the images on screen, reusing the pixels of the ones already listed.
+fn read_images(
+    terminal: &GhosttyTerminal<'static, 'static>,
+    snapshot: &Snapshot<'static, '_>,
+    iterator: &mut ImageIterator<'static>,
+    textures: &mut HashMap<(u32, u64), Arc<RenderImage>>,
+) -> Vec<TerminalImage> {
+    // Placements are measured in the pixels the terminal was given per cell.
+    let cell_width = terminal.width_px().expect("read width") as f32
+        / f32::from(terminal.cols().expect("read columns"));
+    let cell_height = terminal.height_px().expect("read height") as f32
+        / f32::from(terminal.rows().expect("read rows"));
+    let graphics = terminal.kitty_graphics().expect("read kitty graphics");
+    let mut shown = HashMap::default();
+    let mut placements = Vec::new();
+    let mut iteration = iterator.update(snapshot).expect("iterate images");
+    while let Some(placement) = iteration.next() {
+        // Later libghostty versions may add protocols.
+        let Ok(ImageProtocol::Kitty) = placement.protocol() else {
+            continue;
+        };
+        if placement.source_width().expect("read image source width") == 0
+            || placement.source_height().expect("read image source height") == 0
+        {
+            continue;
+        }
+        let key = (
+            placement.image_id().expect("read image id"),
+            placement.image_generation().expect("read image generation"),
+        );
+        let texture = match shown.get(&key).or_else(|| textures.get(&key)) {
+            Some(texture) => Arc::clone(texture),
+            None => {
+                // The pixels may still be on their way.
+                let Some(texture) = graphics.image(key.0).and_then(|image| render_image(&image))
+                else {
+                    continue;
+                };
+                Arc::new(texture)
+            }
+        };
+        shown.insert(key, Arc::clone(&texture));
+
+        let read =
+            |value: libghostty_vt::error::Result<u32>| value.expect("read image placement") as f32;
+        let column = placement.viewport_col().expect("read image column") as f32;
+        let row = placement.viewport_row().expect("read image row") as f32;
+        let pixels = texture.size(0);
+        placements.push((
+            placement.z().expect("read image z-index"),
+            TerminalImage {
+                layer: match placement.layer().expect("read image layer") {
+                    ImageLayer::BelowBackground => TerminalImageLayer::BelowBackground,
+                    ImageLayer::BelowText => TerminalImageLayer::BelowText,
+                    ImageLayer::AboveText => TerminalImageLayer::AboveText,
+                },
+                bounds: Bounds {
+                    origin: point(
+                        column + read(placement.cell_offset_x()) / cell_width,
+                        row + read(placement.cell_offset_y()) / cell_height,
+                    ),
+                    size: size(
+                        read(placement.pixel_width()) / cell_width,
+                        read(placement.pixel_height()) / cell_height,
+                    ),
+                },
+                source: Bounds {
+                    origin: point(read(placement.source_x()), read(placement.source_y())),
+                    size: size(
+                        read(placement.source_width()),
+                        read(placement.source_height()),
+                    ),
+                },
+                image_size: size(pixels.width.0 as f32, pixels.height.0 as f32),
+                image: texture,
+            },
+        ));
+    }
+    *textures = shown;
+    placements.sort_by_key(|(z, image)| (image.layer, *z));
+    placements.into_iter().map(|(_, image)| image).collect()
+}
+
+/// Converts an image's pixels to the BGRA that GPUI draws, or `None` while they are incomplete.
+fn render_image(image: &KittyImage<'_>) -> Option<RenderImage> {
+    let pixels = image.data().expect("read image pixels")?;
+    let (width, height) = (
+        image.width().expect("read image width"),
+        image.height().expect("read image height"),
+    );
+    let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+    match image.format().expect("read image format") {
+        KittyImageFormat::Rgba => {
+            for pixel in pixels.chunks_exact(4) {
+                bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        }
+        KittyImageFormat::Rgb => {
+            for pixel in pixels.chunks_exact(3) {
+                bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], u8::MAX]);
+            }
+        }
+        KittyImageFormat::GrayAlpha => {
+            for pixel in pixels.chunks_exact(2) {
+                bgra.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        KittyImageFormat::Gray => {
+            for &gray in pixels {
+                bgra.extend_from_slice(&[gray, gray, gray, u8::MAX]);
+            }
+        }
+        format => panic!("libghostty stores decoded pixels, not {format:?}"),
+    }
+    let buffer =
+        image::RgbaImage::from_raw(width, height, bgra).expect("image pixels match the image size");
+    Some(RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+/// libghostty's largest kitty graphics image side, in pixels.
+const MAX_IMAGE_SIDE: u32 = 10_000;
+
+/// libghostty's largest decoded kitty graphics image.
+const MAX_IMAGE_BYTES: u64 = 400 * 1024 * 1024;
+
+/// Decodes PNG images that programs send, with the decoder GPUI uses.
+struct PngDecoder;
+
+impl DecodePng for PngDecoder {
+    fn decode_png<'alloc>(
+        &mut self,
+        alloc: &'alloc Allocator<'_>,
+        data: &[u8],
+    ) -> Option<DecodedImage<'alloc>> {
+        // libghostty rejects larger images, so don't spend memory decoding them.
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_SIDE);
+        limits.max_image_height = Some(MAX_IMAGE_SIDE);
+        limits.max_alloc = Some(MAX_IMAGE_BYTES);
+        let mut reader =
+            image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Png);
+        reader.limits(limits);
+        // A PNG that fails to decode is reported to the program as an error.
+        let image = reader.decode().ok()?.into_rgba8();
+        let mut pixels = Bytes::new_with_alloc(alloc, image.as_raw().len()).ok()?;
+        pixels.copy_from_slice(image.as_raw());
+        Some(DecodedImage {
+            width: image.width(),
+            height: image.height(),
+            data: pixels,
+        })
     }
 }
 
@@ -1688,6 +1882,7 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
         display_offset,
         cursor,
         cursor_blinking,
+        images,
     } = term.renderer.borrow_mut().display_frame(&term.terminal);
     if cursor_blinking != term.cursor_blinking.replace(cursor_blinking) {
         term.events.send(TerminalBackendEvent::CursorBlinkingChange);
@@ -1736,6 +1931,7 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
         scrolled_to_top: display_offset == history,
         scrolled_to_bottom: display_offset == 0,
         bottom_row_occupied,
+        images,
     }
 }
 
@@ -2447,6 +2643,38 @@ mod tests {
         assert_eq!(line_text(&live_frame(&term), 0), "before");
         term.terminal.vt_write(b"\x1b[?2026l");
         assert_eq!(line_text(&live_frame(&term), 0), "after");
+    }
+
+    #[test]
+    fn shows_kitty_graphics_images() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        // A 2x2 RGBA image, placed at the cursor on the second row.
+        term.terminal
+            .vt_write(b"\r\n\x1b_Ga=T,f=32,s=2,v=2,i=7;/wAA/wD/AP8AAP///////w==\x1b\\");
+        let Ok(PtyEvent::Event(TerminalBackendEvent::PtyWrite(reply), _)) = events.try_recv()
+        else {
+            panic!("expected a kitty graphics reply");
+        };
+        assert_eq!(reply, "\x1b_Gi=7;OK\x1b\\");
+
+        let images = live_frame(&term).images;
+        let [image] = images.as_slice() else {
+            panic!("expected one image, got {}", images.len());
+        };
+        assert_eq!(image.layer, TerminalImageLayer::AboveText);
+        // Cells are 10 pixels square, so the image covers a fifth of one.
+        assert_eq!(image.bounds.origin, point(0., 1.));
+        assert_eq!(image.bounds.size, size(0.2, 0.2));
+        assert_eq!(image.source.size, size(2., 2.));
+        assert_eq!(
+            &image.image.as_bytes(0).unwrap()[..8],
+            [0, 0, 255, 255, 0, 255, 0, 255]
+        );
+
+        // Images scroll with the text.
+        term.terminal.vt_write(b"\x1b[3;1H\n");
+        assert_eq!(live_frame(&term).images[0].bounds.origin, point(0., 0.));
     }
 
     #[test]
