@@ -9,8 +9,14 @@ mod ghostty;
 use alacritty as backend;
 #[cfg(feature = "ghostty")]
 use ghostty as backend;
+mod program_status;
 mod pty_info;
 pub mod terminal_settings;
+
+use program_status::ProgramStatusRecords;
+pub use program_status::{
+    ProgramState, ProgramStatusReport, ProgressState, TerminalProgress, TerminalStatus,
+};
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -768,6 +774,13 @@ pub enum Event {
     OutputReplaced,
     CloseTerminal,
     Bell,
+    /// A program asked for the user's attention, with text to show.
+    Notification {
+        title: String,
+        body: String,
+    },
+    /// The progress or program status shown for the terminal changed.
+    StatusChanged,
     Wakeup,
     BlinkChanged(bool),
     SelectionsChanged,
@@ -835,6 +848,20 @@ pub(crate) enum TerminalBackendEvent {
     CursorBlinkingChange,
     Wakeup,
     Bell,
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    DesktopNotification {
+        title: String,
+        body: String,
+    },
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    Progress(Option<TerminalProgress>),
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    ProgramStatus(ProgramStatusReport),
+    /// Removes the program status record with this id and every record beneath it.
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    ProgramStatusClear(String),
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    PromptStart,
     Exit,
     ChildExit(ExitStatus),
 }
@@ -853,6 +880,13 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::CursorBlinkingChange => f.write_str("CursorBlinkingChange"),
             Self::Wakeup => f.write_str("Wakeup"),
             Self::Bell => f.write_str("Bell"),
+            Self::DesktopNotification { title, body } => {
+                write!(f, "DesktopNotification({title}, {body})")
+            }
+            Self::Progress(progress) => write!(f, "Progress({progress:?})"),
+            Self::ProgramStatus(report) => write!(f, "ProgramStatus({report:?})"),
+            Self::ProgramStatusClear(id) => write!(f, "ProgramStatusClear({id:?})"),
+            Self::PromptStart => f.write_str("PromptStart"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
         }
@@ -1148,6 +1182,8 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
+            progress: None,
+            program_status: ProgramStatusRecords::default(),
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -1435,6 +1471,8 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
+                progress: None,
+                program_status: ProgramStatusRecords::default(),
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1645,6 +1683,8 @@ pub struct Terminal {
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
+    progress: Option<TerminalProgress>,
+    program_status: ProgramStatusRecords,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1797,7 +1837,34 @@ impl Terminal {
             TerminalBackendEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            TerminalBackendEvent::Exit => self.register_task_finished(None, cx),
+            TerminalBackendEvent::DesktopNotification { title, body } => {
+                cx.emit(Event::Notification { title, body });
+            }
+            TerminalBackendEvent::Progress(progress) => {
+                if self.progress != progress {
+                    self.progress = progress;
+                    cx.emit(Event::StatusChanged);
+                }
+            }
+            TerminalBackendEvent::ProgramStatus(report) => {
+                let needs_user = self.program_status.apply(report);
+                cx.emit(Event::StatusChanged);
+                if let Some(record) = needs_user {
+                    cx.emit(Event::Notification {
+                        title: record.label().to_owned(),
+                        body: record.message,
+                    });
+                }
+            }
+            TerminalBackendEvent::ProgramStatusClear(id) => {
+                self.program_status.clear(&id);
+                cx.emit(Event::StatusChanged);
+            }
+            TerminalBackendEvent::PromptStart => self.clear_running_status(cx),
+            TerminalBackendEvent::Exit => {
+                self.clear_running_status(cx);
+                self.register_task_finished(None, cx);
+            }
             TerminalBackendEvent::MouseCursorDirty => {
                 //NOOP, Handled in render
             }
@@ -1807,6 +1874,13 @@ impl Terminal {
 
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
                     info.emit_title_changed_if_changed(cx);
+                    // Shells without prompt marks don't say when a program ended,
+                    // but the shell is in the foreground again once it has.
+                    if self.has_running_status()
+                        && info.pid() == Some(info.pid_getter().fallback_pid())
+                    {
+                        self.clear_running_status(cx);
+                    }
                 }
             }
             TerminalBackendEvent::ColorRequest(index, format) => {
@@ -1824,9 +1898,39 @@ impl Terminal {
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
+                self.clear_running_status(cx);
                 self.register_task_finished(Some(exit_status), cx);
             }
         }
+    }
+
+    fn has_running_status(&self) -> bool {
+        self.progress.is_some() || self.program_status.has_running()
+    }
+
+    /// Removes progress and status records of work that ends with its program.
+    fn clear_running_status(&mut self, cx: &mut Context<Self>) {
+        let cleared_progress = self.progress.take().is_some();
+        if self.program_status.clear_running() || cleared_progress {
+            cx.emit(Event::StatusChanged);
+        }
+    }
+
+    /// Removes status records of finished work, once the user has seen them.
+    pub fn clear_finished_status(&mut self, cx: &mut Context<Self>) {
+        if self.program_status.clear_finished() {
+            cx.emit(Event::StatusChanged);
+        }
+    }
+
+    /// What to show about the program's work: the status record that most needs
+    /// the user, else the progress it reported.
+    pub fn status(&self) -> Option<TerminalStatus> {
+        self.program_status
+            .most_urgent()
+            .filter(|record| record.state != ProgramState::Idle)
+            .map(TerminalStatus::Program)
+            .or_else(|| self.progress.map(TerminalStatus::Progress))
     }
 
     pub fn selection_started(&self) -> bool {
@@ -2128,6 +2232,8 @@ impl Terminal {
         self.output_generation = generation;
         self.term = term;
         self.output_processor = None;
+        self.progress = None;
+        self.program_status = ProgramStatusRecords::default();
         // The new emulator already has the latest requested size; older resizes can truncate it.
         self.events.clear();
         self.last_content = Content {
