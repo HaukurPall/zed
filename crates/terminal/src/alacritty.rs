@@ -30,6 +30,7 @@ use alacritty_terminal::{
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
+use gpui::Keystroke;
 use theme::Theme;
 use util::paths::PathStyle;
 use vte::ansi::{Handler, Processor, Rgb, StdSyncHandler};
@@ -40,6 +41,7 @@ use crate::{
     Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
     PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
     SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion, adjusted_last_hovered_word,
+    mappings::keys::to_esc_str,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -278,6 +280,15 @@ impl OutputParser {
     }
 }
 
+pub(super) fn encode_key(
+    _term: &TermLock,
+    keystroke: &Keystroke,
+    mode: Modes,
+    option_as_meta: bool,
+) -> Option<Cow<'static, str>> {
+    to_esc_str(keystroke, mode, option_as_meta)
+}
+
 pub(super) fn scroll_display(term: &mut Term, scroll: Scroll) {
     term.scroll_display(scroll.to_alacritty());
 }
@@ -417,12 +428,18 @@ impl ViMotion {
 }
 
 impl Search {
+    pub const SUPPORTS_REGEX: bool = true;
+
     pub fn new(search: &str) -> Option<Self> {
         Some(Self {
             search: SearchData {
                 search: RegexSearch::new(search).ok()?,
             },
         })
+    }
+
+    pub fn literal(text: &str) -> Option<Self> {
+        Self::new(&regex::escape(text))
     }
 
     fn into_alacritty(self) -> RegexSearch {
@@ -1087,7 +1104,7 @@ pub(super) unsafe fn append_text_to_term(term: &mut Term, text_lines: &[&str]) {
     }
 }
 
-pub(super) fn search_matches(term: &Term, searcher: Search) -> Vec<Range> {
+pub(super) fn search_matches(term: &mut Term, searcher: Search) -> Vec<Range> {
     let mut searcher = searcher.into_alacritty();
     all_search_matches(term, &mut searcher)
         .map(Range::from_alacritty)
