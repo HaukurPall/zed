@@ -942,6 +942,7 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
         scrolled_to_top: content.display_offset == term.history_size(),
         scrolled_to_bottom: content.display_offset == 0,
         bottom_row_occupied,
+        images: Vec::new(),
     }
 }
 
