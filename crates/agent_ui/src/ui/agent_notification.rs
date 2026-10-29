@@ -34,6 +34,11 @@ impl AgentNotification {
         &self.title
     }
 
+    #[cfg(test)]
+    pub fn caption(&self) -> Option<&SharedString> {
+        self.caption.as_ref()
+    }
+
     pub fn window_options(screen: Rc<dyn PlatformDisplay>, cx: &App) -> WindowOptions {
         let size = Size {
             width: px(450.),
