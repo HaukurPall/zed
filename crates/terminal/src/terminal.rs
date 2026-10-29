@@ -3190,6 +3190,18 @@ impl Terminal {
         }
     }
 
+    /// The working directory of the shell the terminal started, unlike
+    /// [`Self::working_directory`], which follows the foreground program.
+    pub fn shell_working_directory(&self) -> Option<PathBuf> {
+        if self.is_remote_terminal {
+            return None;
+        }
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.child_cwd(),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
         match &self.terminal_type {
