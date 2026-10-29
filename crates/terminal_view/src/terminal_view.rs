@@ -35,9 +35,9 @@ use std::{
 use task::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
-    PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
-    ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
-    TerminalBounds, ToggleViMode,
+    PasteText, Point, ProgramState, ProgressState, Range, ScrollLineDown, ScrollLineUp,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette,
+    TaskState, TaskStatus, Terminal, TerminalBounds, TerminalStatus, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -45,7 +45,7 @@ use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
 use ui::{
-    ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    CommonAnimationExt, ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
@@ -590,6 +590,8 @@ impl TerminalView {
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
+        self.terminal
+            .update(cx, |terminal, cx| terminal.clear_finished_status(cx));
         cx.emit(Event::Wakeup);
     }
 
@@ -1203,6 +1205,42 @@ impl TerminalView {
     }
 }
 
+/// The tab icon for what the terminal's program reports, and whether it spins.
+fn status_icon(terminal: &Terminal) -> (IconName, Color, bool) {
+    match terminal.status() {
+        Some(TerminalStatus::Program(record)) => match record.state {
+            ProgramState::Working => (IconName::LoadCircle, Color::Muted, true),
+            ProgramState::Blocked => (IconName::Warning, Color::Warning, false),
+            ProgramState::Done => (IconName::Check, Color::Success, false),
+            ProgramState::Error => (IconName::XCircle, Color::Error, false),
+            ProgramState::Idle => (IconName::Terminal, Color::Muted, false),
+        },
+        Some(TerminalStatus::Progress(progress)) => match progress.state {
+            ProgressState::Normal | ProgressState::Indeterminate => {
+                (IconName::LoadCircle, Color::Muted, true)
+            }
+            ProgressState::Paused => (IconName::LoadCircle, Color::Muted, false),
+            ProgressState::Error => (IconName::XCircle, Color::Error, false),
+        },
+        None => (IconName::Terminal, Color::Muted, false),
+    }
+}
+
+/// What the terminal's program reports, for the tab tooltip.
+fn status_text(terminal: &Terminal) -> Option<String> {
+    let mut parts = Vec::new();
+    let percent = match terminal.status()? {
+        TerminalStatus::Program(record) => {
+            parts.extend([record.app, record.title, record.message]);
+            record.progress
+        }
+        TerminalStatus::Progress(progress) => progress.percent,
+    };
+    parts.extend(percent.map(|percent| format!("{percent}%")));
+    parts.retain(|part| !part.is_empty());
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
     zed_actions::Rerun {
         task_id: Some(task.0.clone()),
@@ -1259,6 +1297,16 @@ fn subscribe_for_terminal_events(
                         window.play_system_bell();
                     }
                     cx.emit(Event::Wakeup);
+                }
+
+                Event::Notification { .. } => {
+                    terminal_view.has_bell = true;
+                    cx.emit(Event::Wakeup);
+                }
+
+                Event::StatusChanged => {
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
                 }
 
                 Event::BlinkChanged(blinking) => {
@@ -1417,11 +1465,12 @@ impl TerminalView {
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |terminal, _| {
+        self.terminal.update(cx, |terminal, cx| {
             terminal.set_cursor_shape(self.cursor_shape);
             if !self.read_only {
                 terminal.focus_in();
             }
+            terminal.clear_finished_status(cx);
         });
 
         let should_blink = match TerminalSettings::get_global(cx).blinking {
@@ -1593,11 +1642,15 @@ impl Item for TerminalView {
             let terminal = self.terminal().read(cx);
             let title = terminal.title(false);
             let pid = terminal.pid_getter()?.fallback_pid();
+            let status = status_text(terminal);
 
             move |_, _| {
                 v_flex()
                     .gap_1()
                     .child(Label::new(title.clone()))
+                    .when_some(status.clone(), |this, status| {
+                        this.child(Label::new(status).size(LabelSize::Small))
+                    })
                     .child(h_flex().flex_grow_1().child(Divider::horizontal()))
                     .child(
                         Label::new(format!("Process ID (PID): {}", pid))
@@ -1618,6 +1671,7 @@ impl Item for TerminalView {
             .cloned()
             .unwrap_or_else(|| terminal.title(true));
 
+        let mut spinning = false;
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
                 TaskStatus::Running => (
@@ -1640,7 +1694,17 @@ impl Item for TerminalView {
                     }
                 }
             },
-            None => (IconName::Terminal, Color::Muted, None),
+            None => {
+                let (icon, color, spins) = status_icon(terminal);
+                spinning = spins;
+                (icon, color, None)
+            }
+        };
+        let icon = Icon::new(icon).color(icon_color);
+        let icon = if spinning {
+            icon.with_rotate_animation(2).into_any_element()
+        } else {
+            icon.into_any_element()
         };
 
         let self_handle = self.self_handle.clone();
@@ -1663,7 +1727,7 @@ impl Item for TerminalView {
                             .when(rerun_button.is_some(), |this| {
                                 this.hover(|style| style.invisible().w_0())
                             })
-                            .child(Icon::new(icon).color(icon_color)),
+                            .child(icon),
                     )
                     .when_some(rerun_button, |this, rerun_button| {
                         this.child(

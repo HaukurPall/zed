@@ -47,23 +47,25 @@ use libghostty_vt::{
     selection::{FormatOptions, Selection as GhosttySelection},
     style::{Id as StyleId, Palette, RgbColor, Style, StyleColor, Underline},
     terminal::{
-        ClipboardWriteError, CompressionActivity, CompressionMode, CompressionResult,
+        ClipboardWriteError, ColorScheme, CompressionActivity, CompressionMode, CompressionResult,
         ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
         Point as GhosttyPoint, PointCoordinate, PointSpace, PrimaryDeviceAttributes,
-        ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
+        ProgramStatusState, ProgressState as GhosttyProgressState, ScrollViewport,
+        SecondaryDeviceAttributes, SemanticPromptKind, SizeReportSize,
     },
 };
 use parking_lot::{Mutex, MutexGuard};
 use polling::{Event as PollEvent, Events, PollMode, Poller};
-use theme::Theme;
+use theme::{Appearance, Theme};
 use util::paths::{PathStyle, UrlExt as _};
 use vte::ansi::{Color, NamedColor, Rgb};
 
 use crate::{
     Cell, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
-    PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionAnchor, SelectionRange,
-    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, TerminalImage,
-    TerminalImageLayer, ViMotion, adjusted_last_hovered_word, get_color_at_index,
+    ProgramState, ProgramStatusReport, ProgressState, PtyEvent, Range, RenderableCells, Scroll,
+    Search, Selection, SelectionAnchor, SelectionRange, SelectionSide, SelectionType,
+    TerminalBackendEvent, TerminalBounds, TerminalImage, TerminalImageLayer, TerminalProgress,
+    ViMotion, adjusted_last_hovered_word, get_color_at_index,
     mappings::{colors::to_vte_rgb, keys::to_esc_str},
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
@@ -207,6 +209,8 @@ pub(super) struct Term {
     config: TermConfig,
     /// The theme whose colors libghostty reports to programs.
     theme: Option<Arc<Theme>>,
+    /// Shared with the callback that answers color scheme queries.
+    color_scheme: Rc<StdCell<Option<ColorScheme>>>,
     selection: Option<TermSelection>,
     vi_mode: bool,
     cursor_blinking: StdCell<bool>,
@@ -227,7 +231,7 @@ struct TermSelection {
 // SAFETY: libghostty-vt has no thread affinity. Its headers document using
 // one terminal from an IO thread and a renderer thread as long as access is
 // serialized by a lock, which `TermLock` provides; `Term` is never used
-// without holding it. The `Rc` is shared only with callbacks owned by the
+// without holding it. The `Rc`s are shared only with callbacks owned by the
 // terminal, which run under the same lock.
 unsafe impl Send for Term {}
 
@@ -326,6 +330,69 @@ pub(super) fn set_theme(term: &mut Term, theme: &Arc<Theme>) {
         .set_default_color_palette(Some(Palette(std::array::from_fn(color))))
         .expect("set color palette");
     term.theme = Some(theme.clone());
+
+    let scheme = match theme.appearance {
+        Appearance::Light => ColorScheme::Light,
+        Appearance::Dark => ColorScheme::Dark,
+    };
+    let previous = term.color_scheme.replace(Some(scheme));
+    // Programs that enabled mode 2031 are told when the scheme flips, and
+    // usually query the new colors next.
+    if previous.is_some_and(|previous| previous != scheme)
+        && term
+            .terminal
+            .mode(Mode::COLOR_SCHEME_REPORT)
+            .expect("read color scheme report mode")
+    {
+        let mut report = [0; 16];
+        let length = scheme
+            .encode_report(&mut report)
+            .expect("encode color scheme report");
+        term.events.send(TerminalBackendEvent::PtyWrite(
+            String::from_utf8_lossy(&report[..length]).into_owned(),
+        ));
+    }
+}
+
+/// Longest program-supplied text shown outside the terminal, in characters.
+const MAX_DISPLAY_TEXT: usize = 256;
+
+/// Program-supplied text made safe to show outside the terminal: without
+/// control, format (such as text direction overrides) or separator characters,
+/// invisible fillers, and shortened.
+fn display_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|&character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{00AD}'
+                        | '\u{0600}'..='\u{0605}'
+                        | '\u{061C}'
+                        | '\u{06DD}'
+                        | '\u{070F}'
+                        | '\u{0890}'..='\u{0891}'
+                        | '\u{08E2}'
+                        | '\u{115F}'..='\u{1160}'
+                        | '\u{180E}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{206F}'
+                        | '\u{3164}'
+                        | '\u{FEFF}'
+                        | '\u{FFA0}'
+                        | '\u{FFF9}'..='\u{FFFB}'
+                        | '\u{110BD}'
+                        | '\u{110CD}'
+                        | '\u{13430}'..='\u{1343F}'
+                        | '\u{1BCA0}'..='\u{1BCA3}'
+                        | '\u{1D173}'..='\u{1D17A}'
+                        | '\u{E0000}'..='\u{E007F}'
+                )
+        })
+        .take(MAX_DISPLAY_TEXT)
+        .collect()
 }
 
 /// Writes bytes after aborting any escape sequence a previous writer left unfinished.
@@ -461,6 +528,74 @@ pub(super) fn new_term(
     terminal
         .on_xtversion(|_| Some("zed"))
         .expect("register xtversion callback");
+    let color_scheme = Rc::new(StdCell::new(None));
+    let scheme = color_scheme.clone();
+    terminal
+        .on_color_scheme(move |_| scheme.get())
+        .expect("register color scheme callback");
+    let sink = events.clone();
+    terminal
+        .on_desktop_notification(move |_, notification| {
+            sink.send(TerminalBackendEvent::DesktopNotification {
+                title: display_text(notification.title()),
+                body: display_text(notification.body()),
+            })
+        })
+        .expect("register desktop notification callback");
+    // The next callbacks ignore states that a newer libghostty may add: a panic
+    // inside a callback aborts the process.
+    let sink = events.clone();
+    terminal
+        .on_progress_report(move |_, report| {
+            let state = match report.state() {
+                Ok(GhosttyProgressState::Remove) => {
+                    return sink.send(TerminalBackendEvent::Progress(None));
+                }
+                Ok(GhosttyProgressState::Set) => ProgressState::Normal,
+                Ok(GhosttyProgressState::Indeterminate) => ProgressState::Indeterminate,
+                Ok(GhosttyProgressState::Error) => ProgressState::Error,
+                Ok(GhosttyProgressState::Pause) => ProgressState::Paused,
+                _ => return,
+            };
+            sink.send(TerminalBackendEvent::Progress(Some(TerminalProgress {
+                state,
+                percent: report.progress(),
+            })))
+        })
+        .expect("register progress report callback");
+    let sink = events.clone();
+    terminal
+        .on_program_status(move |_, report| {
+            let id = String::from_utf8_lossy(report.id()).into_owned();
+            let state = match report.state() {
+                Ok(ProgramStatusState::Idle) => ProgramState::Idle,
+                Ok(ProgramStatusState::Working) => ProgramState::Working,
+                Ok(ProgramStatusState::Done) => ProgramState::Done,
+                Ok(ProgramStatusState::Blocked) => ProgramState::Blocked,
+                Ok(ProgramStatusState::Error) => ProgramState::Error,
+                Ok(ProgramStatusState::Clear) => {
+                    return sink.send(TerminalBackendEvent::ProgramStatusClear(id));
+                }
+                _ => return,
+            };
+            sink.send(TerminalBackendEvent::ProgramStatus(ProgramStatusReport {
+                id,
+                state,
+                progress: report.progress(),
+                app: display_text(report.app()),
+                title: display_text(report.title()),
+                message: display_text(report.message()),
+            }))
+        })
+        .expect("register program status callback");
+    let sink = events.clone();
+    terminal
+        .on_semantic_prompt(move |_, event| {
+            if let Ok(SemanticPromptKind::PromptStart) = event.kind() {
+                sink.send(TerminalBackendEvent::PromptStart);
+            }
+        })
+        .expect("register semantic prompt callback");
     if config.clipboard_writes {
         let sink = events.clone();
         terminal
@@ -485,6 +620,7 @@ pub(super) fn new_term(
         renderer,
         config: config.clone(),
         theme: None,
+        color_scheme,
         selection: None,
         vi_mode: false,
         cursor_blinking: StdCell::new(false),
@@ -2828,6 +2964,63 @@ mod tests {
         // The IO loop schedules compression when this changes, so compressing must not change it.
         assert_eq!(term.terminal.compression_activity().unwrap(), activity);
         assert_eq!(content_text(&term), text);
+    }
+
+    fn backend_events(events: &mut UnboundedReceiver<PtyEvent>) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|PtyEvent::Event(event, _)| format!("{event:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn reports_notifications_progress_and_program_status() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        // A right-to-left override in the body must not reach the UI.
+        term.terminal
+            .vt_write("\x1b]777;notify;Build;done \u{202E}ok\x1b\\".as_bytes());
+        term.terminal
+            .vt_write(b"\x1b]9;4;1;42\x1b\\\x1b]9;4;0\x1b\\");
+        // "QXBwbHk/" is "Apply?".
+        term.terminal.vt_write(
+            b"\x1b]7501;state=blocked:kind=permission:app=terraform:id=us/db:msg=QXBwbHk/\x1b\\",
+        );
+        term.terminal.vt_write(b"\x1b]7501;state=clear\x1b\\");
+        term.terminal.vt_write(b"\x1b]133;A\x1b\\");
+        assert_eq!(
+            backend_events(&mut events),
+            [
+                "DesktopNotification(Build, done ok)",
+                "Progress(Some(TerminalProgress { state: Normal, percent: Some(42) }))",
+                "Progress(None)",
+                "ProgramStatus(ProgramStatusReport { id: \"us/db\", state: Blocked, \
+                 progress: None, app: \"terraform\", title: \"\", message: \"Apply?\" })",
+                "ProgramStatusClear(\"\")",
+                "PromptStart",
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_the_theme_color_scheme() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        let dark = theme::ThemeRegistry::new(Box::new(()))
+            .get(theme::DEFAULT_DARK_THEME)
+            .unwrap();
+        let mut light = (*dark).clone();
+        light.appearance = Appearance::Light;
+        let light = Arc::new(light);
+        let mut term = term.lock();
+        set_theme(&mut term, &dark);
+        term.terminal.vt_write(b"\x1b[?996n");
+        // Changes are reported only once a program asks for them with mode 2031.
+        set_theme(&mut term, &light);
+        term.terminal.vt_write(b"\x1b[?2031h");
+        set_theme(&mut term, &dark);
+        assert_eq!(
+            backend_events(&mut events),
+            ["PtyWrite(\u{1b}[?997;1n)", "PtyWrite(\u{1b}[?997;1n)",]
+        );
     }
 
     #[test]
