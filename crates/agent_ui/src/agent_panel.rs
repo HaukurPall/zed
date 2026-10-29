@@ -963,6 +963,10 @@ struct AgentTerminal {
     title_editor_subscription: Option<Subscription>,
     last_known_title: String,
     last_known_terminal_title: String,
+    /// A restored thread keeps its saved title until a program, not the
+    /// shell that the restore starts, changes the terminal's title.
+    keeps_restored_title: bool,
+    title_seen_while_kept: SharedString,
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
@@ -1013,7 +1017,9 @@ impl AgentTerminal {
 
     fn terminal_title(&self, cx: &App) -> SharedString {
         let title = self.current_terminal_title(cx);
-        if title.is_empty() && !self.last_known_terminal_title.is_empty() {
+        if self.keeps_restored_title
+            || (title.is_empty() && !self.last_known_terminal_title.is_empty())
+        {
             SharedString::from(self.last_known_terminal_title.clone())
         } else {
             title
@@ -1040,7 +1046,13 @@ impl AgentTerminal {
 
     fn refresh_title(&mut self, cx: &mut App) -> bool {
         let terminal_title = self.current_terminal_title(cx);
-        if !terminal_title.is_empty() {
+        if self.keeps_restored_title && terminal_title != self.title_seen_while_kept {
+            let shell_in_foreground = self.view.read(cx).terminal().read(cx).shell_in_foreground();
+            self.keeps_restored_title =
+                terminal_title.is_empty() || shell_in_foreground == Some(true);
+            self.title_seen_while_kept = terminal_title.clone();
+        }
+        if !terminal_title.is_empty() && !self.keeps_restored_title {
             self.last_known_terminal_title = terminal_title.to_string();
         }
 
@@ -2286,6 +2298,7 @@ impl AgentPanel {
             },
         );
 
+        let keeps_restored_title = initial_title.is_some();
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
@@ -2296,6 +2309,8 @@ impl AgentPanel {
             title_editor_subscription: None,
             last_known_title: last_known_terminal_title.clone(),
             last_known_terminal_title,
+            keeps_restored_title,
+            title_seen_while_kept: SharedString::default(),
             last_observed_program: None,
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
@@ -2547,7 +2562,9 @@ impl AgentPanel {
     }
 
     fn terminal_restore_initial_title(metadata: &TerminalThreadMetadata) -> Option<SharedString> {
-        (!metadata.title.is_empty()).then(|| metadata.title.clone())
+        // Status glyphs belong to a program the restore doesn't bring back.
+        let title = terminal_title_without_prefix(&metadata.title);
+        (!title.is_empty()).then(|| SharedString::from(title.to_string()))
     }
 
     fn edit_terminal_title(
@@ -6575,14 +6592,13 @@ impl AgentPanel {
             return true;
         }
 
-        let (working_directory, custom_title, initial_title) = {
+        let (working_directory, custom_title) = {
             let terminal_view = terminal_view.read(cx);
             let working_directory = terminal_view.terminal().read(cx).shell_working_directory();
             let custom_title = terminal_view
                 .custom_title()
                 .map(|title| SharedString::from(title.to_string()));
-            let initial_title = Some(AgentTerminal::terminal_title_for_view(terminal_view, cx));
-            (working_directory, custom_title, initial_title)
+            (working_directory, custom_title)
         };
 
         let item_id = terminal_view.item_id();
@@ -6601,7 +6617,7 @@ impl AgentPanel {
             terminal_view,
             working_directory,
             custom_title,
-            initial_title,
+            None,
             None,
             true,
             true,
@@ -10530,7 +10546,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restored_terminal_uses_metadata_title_until_shell_title_arrives(
+    async fn test_restored_terminal_without_a_local_shell_follows_the_first_title(
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -10580,6 +10596,69 @@ mod tests {
             assert_eq!(terminals.len(), 1);
             assert_eq!(terminals[0].title.as_ref(), "Fresh Shell Title");
         });
+    }
+
+    #[gpui::test]
+    async fn test_restored_terminal_keeps_its_title_until_a_program_sets_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = TerminalId::new();
+        let metadata = TerminalThreadMetadata {
+            terminal_id,
+            title: "⠋ Fix bug".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/project",
+            )])),
+            remote_connection: None,
+            working_directory: None,
+        };
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .restore_test_terminal(metadata, true, AgentThreadSource::Sidebar, None, window, cx)
+                .expect("test terminal should be restored");
+        });
+        cx.run_until_parked();
+
+        let terminal_entity = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should be restored")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        let set_title = |title: &str, shell_in_foreground: bool, cx: &mut VisualTestContext| {
+            terminal_entity.update(cx, |terminal, cx| {
+                terminal.set_shell_in_foreground(Some(shell_in_foreground));
+                terminal.breadcrumb_text = title.to_string();
+                cx.emit(TerminalEvent::BreadcrumbsChanged);
+            });
+            cx.run_until_parked();
+        };
+        let title = |cx: &VisualTestContext| {
+            panel.read_with(cx, |panel, cx| panel.terminals(cx)[0].title.to_string())
+        };
+
+        assert_eq!(title(&cx), "Fix bug");
+
+        set_title("~/project", true, &mut cx);
+        assert_eq!(title(&cx), "Fix bug");
+
+        // A program that leaves the shell's title in place.
+        set_title("~/project", false, &mut cx);
+        assert_eq!(title(&cx), "Fix bug");
+
+        set_title("Fix the other bug", false, &mut cx);
+        assert_eq!(title(&cx), "Fix the other bug");
+
+        set_title("~/project", true, &mut cx);
+        assert_eq!(title(&cx), "~/project");
     }
 
     #[gpui::test]
