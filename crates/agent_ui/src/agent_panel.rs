@@ -2275,11 +2275,23 @@ impl AgentPanel {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                TerminalEvent::Bell => {
+                    this.mark_terminal_notification(terminal_id, None, window, cx)
+                }
+                TerminalEvent::Notification { title, body } => {
+                    let caption = [title.as_str(), body.as_str()]
+                        .into_iter()
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(": ");
+                    let caption = (!caption.is_empty()).then(|| caption.into());
+                    this.mark_terminal_notification(terminal_id, caption, window, cx)
+                }
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
+                | TerminalEvent::StatusChanged
                 | TerminalEvent::OutputReplaced
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
@@ -2684,6 +2696,7 @@ impl AgentPanel {
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
+        caption: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2709,13 +2722,14 @@ impl AgentPanel {
                 self.terminal_status_visible(terminal_id, window, cx),
                 cx,
             );
-            self.show_terminal_notification(terminal_id, window, cx);
+            self.show_terminal_notification(terminal_id, caption, window, cx);
         }
     }
 
     fn show_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
+        caption: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2734,13 +2748,27 @@ impl AgentPanel {
             NotifyWhenAgentWaiting::PrimaryScreen => {
                 window.request_attention();
                 if let Some(primary) = cx.primary_display() {
-                    self.pop_up_terminal_notification(terminal_id, &title, primary, window, cx);
+                    self.pop_up_terminal_notification(
+                        terminal_id,
+                        &title,
+                        caption,
+                        primary,
+                        window,
+                        cx,
+                    );
                 }
             }
             NotifyWhenAgentWaiting::AllScreens => {
                 window.request_attention();
                 for screen in cx.displays() {
-                    self.pop_up_terminal_notification(terminal_id, &title, screen, window, cx);
+                    self.pop_up_terminal_notification(
+                        terminal_id,
+                        &title,
+                        caption.clone(),
+                        screen,
+                        window,
+                        cx,
+                    );
                 }
             }
             NotifyWhenAgentWaiting::Never => {}
@@ -2751,6 +2779,7 @@ impl AgentPanel {
         &mut self,
         terminal_id: TerminalId,
         title: &SharedString,
+        caption: Option<SharedString>,
         screen: Rc<dyn PlatformDisplay>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2767,7 +2796,7 @@ impl AgentPanel {
         });
         let title = title.clone();
         let Ok(screen_window) = cx.open_window(options, |_window, cx| {
-            cx.new(|_cx| AgentNotification::new(title, None, IconName::Terminal, project_name))
+            cx.new(|_cx| AgentNotification::new(title, caption, IconName::Terminal, project_name))
         }) else {
             return;
         };
@@ -7023,6 +7052,16 @@ impl AgentPanel {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn emit_test_terminal_bell(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        self.emit_test_terminal_event(terminal_id, TerminalEvent::Bell, cx);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn emit_test_terminal_event(
+        &mut self,
+        terminal_id: TerminalId,
+        event: TerminalEvent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(terminal_entity) = self
             .terminals
             .get(&terminal_id)
@@ -7031,7 +7070,7 @@ impl AgentPanel {
             return;
         };
         terminal_entity.update(cx, |_terminal, cx| {
-            cx.emit(TerminalEvent::Bell);
+            cx.emit(event);
         });
     }
 
@@ -11009,6 +11048,51 @@ mod tests {
                 .expect("first terminal should remain in the panel");
             assert!(!first_terminal.has_notification);
         });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_notification_pops_up_with_its_text(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let first_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Build", true, window, cx)
+            })
+            .expect("first test terminal should be inserted");
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Server", true, window, cx)
+            })
+            .expect("second test terminal should be inserted");
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.emit_test_terminal_event(
+                first_terminal_id,
+                TerminalEvent::Notification {
+                    title: "cargo".into(),
+                    body: "Tests passed".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let first_terminal = panel
+                .terminals(cx)
+                .into_iter()
+                .find(|terminal| terminal.id == first_terminal_id)
+                .expect("first terminal should remain in the panel");
+            assert!(first_terminal.has_notification);
+        });
+        let caption = cx
+            .windows()
+            .iter()
+            .find_map(|window| window.downcast::<AgentNotification>())
+            .expect("expected a notification pop-up")
+            .read_with(&cx, |notification, _cx| notification.caption().cloned())
+            .unwrap();
+        assert_eq!(caption.as_deref(), Some("cargo: Tests passed"));
     }
 
     #[gpui::test]
