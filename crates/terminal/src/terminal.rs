@@ -3404,6 +3404,18 @@ impl Terminal {
             .filter(|report| report.holds(foreground, shell_in_foreground))
     }
 
+    /// The working directory of the shell the terminal started, unlike
+    /// [`Self::working_directory`], which follows the foreground program.
+    pub fn shell_working_directory(&self) -> Option<PathBuf> {
+        if self.is_remote_terminal {
+            return None;
+        }
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.shell_cwd(),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
         match &self.terminal_type {
@@ -7286,6 +7298,29 @@ mod tests {
             terminal.update(cx, |terminal, cx| {
                 terminal.process_event(TerminalBackendEvent::Wakeup, cx);
                 assert!(!terminal.has_running_status(), "under login: {under_login}");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_shell_working_directory_follows_the_shell(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        for under_login in [false, true] {
+            let terminal = build_bash_terminal(cx, under_login).await;
+            type_into(&terminal, "cd / && sleep 30\n", cx);
+            wait_for_shell_in_foreground(&terminal, false, cx).await;
+            terminal.read_with(cx, |terminal, _| {
+                let TerminalType::Pty { info, .. } = &terminal.terminal_type else {
+                    panic!("expected a PTY terminal");
+                };
+                assert!(info.load_for_test().is_some());
+                assert_eq!(
+                    terminal.shell_working_directory(),
+                    Some(PathBuf::from("/")),
+                    "under login: {under_login}"
+                );
             });
         }
     }

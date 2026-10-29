@@ -160,9 +160,24 @@ impl PtyProcessInfo {
         false
     }
 
+    /// The shell the terminal started, as far as it is known: under `login`,
+    /// `login` itself until the shell has been seen in the foreground.
+    fn shell_pid(&self) -> Pid {
+        self.login_shell
+            .as_ref()
+            .and_then(|login_shell| login_shell.shell.get())
+            .copied()
+            .unwrap_or_else(|| self.pid_getter.fallback_pid())
+    }
+
     fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
         let pid = self.pid_getter.pid()?;
-        let fallback_pid = self.pid_getter.fallback_pid();
+        let child = self.pid_getter.fallback_pid();
+        let shell = if self.is_shell(pid) {
+            pid
+        } else {
+            self.shell_pid()
+        };
         let mut system = self.system.write();
         // sysinfo never evicts processes that are absent from the refreshed pid
         // set, so entries for former foreground processes (each pinning an open
@@ -172,13 +187,10 @@ impl PtyProcessInfo {
         if self.last_foreground_pid.lock().replace(pid) != Some(pid) {
             *system = System::new();
         }
-        let pids = [pid, fallback_pid];
-        let pids = if pid == fallback_pid {
-            &pids[..1]
-        } else {
-            &pids[..]
-        };
-        system.refresh_processes_specifics(ProcessesToUpdate::Some(pids), true, self.refresh_kind);
+        let mut pids = vec![pid, child, shell];
+        pids.sort_unstable();
+        pids.dedup();
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, self.refresh_kind);
         drop(system);
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
@@ -186,6 +198,14 @@ impl PtyProcessInfo {
     fn get_child(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
         let pid = self.pid_getter.fallback_pid();
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
+    }
+
+    /// The working directory of the shell the terminal started, as of the last
+    /// refresh.
+    pub(crate) fn shell_cwd(&self) -> Option<PathBuf> {
+        let shell = self.shell_pid();
+        let system = self.system.read();
+        system.process(shell)?.cwd().map(PathBuf::from)
     }
 
     #[cfg(unix)]
@@ -334,6 +354,28 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test needs a real child process and may block"
+    )]
+    fn shell_cwd_is_the_spawned_childs_directory() {
+        let directory = tempfile::tempdir().expect("create a temporary directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(directory.path())
+            .spawn()
+            .expect("failed to spawn child process");
+        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, child.id()), false);
+        assert!(info.load_for_test().is_some());
+        assert_eq!(
+            info.shell_cwd(),
+            Some(directory.path().canonicalize().expect("canonicalize"))
+        );
+        child.kill().expect("failed to kill child process");
+        child.wait().expect("failed to wait for child process");
+    }
+
     /// `sh` stands in for `login`: it waits for the shell it runs, and an
     /// interactive shell moves to its own process group.
     #[test]
@@ -362,10 +404,12 @@ mod tests {
         assert!(!PtyProcessInfo::new(pid_getter, false).is_shell(shell));
 
         pty.writer()
-            .write_all(b"sleep 30\n")
+            .write_all(b"cd / && sleep 30\n")
             .expect("write to the PTY");
         let command = wait_for_foreground(&pid_getter, |pid| pid != shell);
         assert!(!info.is_shell(command));
+        assert!(info.load_for_test().is_some());
+        assert_eq!(info.shell_cwd(), Some(PathBuf::from("/")));
 
         // The shell's job isn't taken for the shell before the shell is known.
         let info = PtyProcessInfo::new(pid_getter, true);
