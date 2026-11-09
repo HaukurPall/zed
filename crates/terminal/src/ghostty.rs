@@ -31,6 +31,7 @@ use gpui::{Bounds, Keystroke, RenderImage, point, size};
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
     alloc::{Allocator, Bytes},
+    fmt::Formatter,
     key::{
         Action as KeyAction, Encoder as KeyEncoder, Event as KeyEvent, Key, Mods as KeyMods,
         OptionAsAlt,
@@ -42,9 +43,9 @@ use libghostty_vt::{
         CellIterator, CursorVisualStyle, Dirty, ImageIterator, ImageLayer, ImageProtocol,
         RenderState, RowId, RowIteration, RowIterator, Snapshot,
     },
-    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
+    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef, cell as cell_key},
     search::{MatchBuffer, Search as GhosttySearch},
-    selection::{FormatOptions, Selection as GhosttySelection},
+    selection::Selection as GhosttySelection,
     style::{Id as StyleId, Palette, RgbColor, Style, StyleColor, Underline},
     terminal::{
         ClipboardWriteError, ColorScheme, CompressionActivity, CompressionMode, CompressionResult,
@@ -298,7 +299,7 @@ pub(super) fn apply_config(term: &TermLock, config: &TermConfig) {
 /// Limits history by lines only; libghostty's default byte limit keeps a few hundred lines.
 fn set_scrollback_limit(terminal: &mut GhosttyTerminal, lines: usize) {
     terminal
-        .set_scrollback_max_bytes(None)
+        .set_scrollback_max_bytes(Some(usize::MAX))
         .and_then(|terminal| terminal.set_scrollback_max_lines(Some(lines)))
         .expect("set scrollback limit");
 }
@@ -1326,10 +1327,12 @@ fn line_end(term: &Term, mut point: Point) -> Point {
 }
 
 pub(super) fn selection_text(term: &Term) -> Option<String> {
-    let bytes = term
-        .terminal
-        .format_selection_alloc(None, FormatOptions::new().with_unwrap(true).with_trim(true))
-        .expect("format selection")?;
+    let mut formatter = Formatter::new_selection(&term.terminal).expect("create formatter")?;
+    let bytes = formatter
+        .set_unwrap(true)
+        .and_then(|formatter| formatter.set_trim(true))
+        .and_then(|formatter| formatter.format_alloc(None))
+        .expect("format selection");
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1755,7 +1758,10 @@ fn read_images(
         / f32::from(terminal.cols().expect("read columns"));
     let cell_height = terminal.height_px().expect("read height") as f32
         / f32::from(terminal.rows().expect("read rows"));
-    let graphics = terminal.kitty_graphics().expect("read kitty graphics");
+    let graphics = terminal
+        .kitty_graphics()
+        .expect("read kitty graphics")
+        .expect("kitty graphics are enabled when the terminal is created");
     let mut shown = HashMap::default();
     let mut placements = Vec::new();
     let mut iteration = iterator.update(snapshot).expect("iterate images");
@@ -1887,7 +1893,7 @@ impl DecodePng for PngDecoder {
         reader.limits(limits);
         // A PNG that fails to decode is reported to the program as an error.
         let image = reader.decode().ok()?.into_rgba8();
-        let mut pixels = Bytes::new_with_alloc(alloc, image.as_raw().len()).ok()?;
+        let mut pixels = Bytes::new_zeroed_with_alloc(alloc, image.as_raw().len()).ok()?;
         pixels.copy_from_slice(image.as_raw());
         Some(DecodedImage {
             width: image.width(),
@@ -1938,10 +1944,19 @@ fn read_row(
     let mut column = 0;
     while let Some(cell) = cell_iteration.next() {
         let raw = cell.raw_cell().expect("read cell");
-        let content = raw.content_tag().expect("read cell content");
+        let (content, codepoint, wide, has_styling, style_id, has_hyperlink) = raw
+            .get_multi((
+                cell_key::ContentTag,
+                cell_key::Codepoint,
+                cell_key::Wide,
+                cell_key::HasStyling,
+                cell_key::StyleId,
+                cell_key::HasHyperlink,
+            ))
+            .expect("read cell");
         let mut data = CellData::default();
         match content {
-            CellContentTag::Codepoint => match raw.codepoint().expect("read codepoint") {
+            CellContentTag::Codepoint => match codepoint {
                 0 => {}
                 codepoint => {
                     data.character = char::from_u32(codepoint).expect("cells hold valid codepoints")
@@ -1969,19 +1984,16 @@ fn read_row(
                 });
             }
         }
-        data.flags.set(
-            CellFlags::WIDE_CHAR_SPACER,
-            raw.wide().expect("read cell width") == CellWide::SpacerTail,
-        );
+        data.flags
+            .set(CellFlags::WIDE_CHAR_SPACER, wide == CellWide::SpacerTail);
 
         // Most cells use the default style, which needs no lookup.
-        if raw.has_styling().expect("read cell styling") {
-            let id = raw.style_id().expect("read cell style id");
-            let style = match styles.iter().find(|(cached, _)| *cached == id) {
+        if has_styling {
+            let style = match styles.iter().find(|(cached, _)| *cached == style_id) {
                 Some((_, style)) => *style,
                 None => {
                     let style = CellStyle::new(cell.style().expect("read cell style"));
-                    styles.push((id, style));
+                    styles.push((style_id, style));
                     style
                 }
             };
@@ -1995,7 +2007,7 @@ fn read_row(
             data.flags.0 |= style.flags.0;
         }
 
-        if raw.has_hyperlink().expect("read cell hyperlink") {
+        if has_hyperlink {
             let grid_ref = terminal
                 .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
                     x: column,
@@ -2088,19 +2100,15 @@ pub(super) fn content_text(term: &Term) -> String {
     let Some(all) = term.terminal.select_all().expect("select all") else {
         return String::new();
     };
-    let bytes = term
-        .terminal
-        .format_selection_alloc(
-            None,
-            FormatOptions::new()
-                .with_selection(&all)
-                .with_unwrap(true)
-                .with_trim(true),
-        )
+    let mut formatter = Formatter::new(&term.terminal).expect("create formatter");
+    // SAFETY: `all` is a snapshot of this terminal's active screen, and the
+    // formatter's shared borrow keeps the terminal from changing until it is dropped.
+    let bytes = unsafe { formatter.set_selection(Some(&all)) }
+        .and_then(|formatter| formatter.set_unwrap(true))
+        .and_then(|formatter| formatter.set_trim(true))
+        .and_then(|formatter| formatter.format_alloc(None))
         .expect("format terminal content");
-    bytes.map_or_else(String::new, |bytes| {
-        String::from_utf8_lossy(&bytes).into_owned()
-    })
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(super) fn full_content_range(term: &Term) -> Range {
@@ -2936,12 +2944,13 @@ mod tests {
     #[test]
     fn keeps_the_configured_number_of_history_lines() {
         let (term, _events) = test_term(SettingsCursorShape::Block);
-        apply_config(&term, &pty_term_config(5_000, SettingsCursorShape::Block));
+        apply_config(&term, &pty_term_config(50_000, SettingsCursorShape::Block));
         let mut term = term.lock();
-        for line in 0..2_000 {
+        // Enough lines to fill several of libghostty's pages.
+        for line in 0..40_000 {
             term.terminal.vt_write(format!("{line}\r\n").as_bytes());
         }
-        assert_eq!(history_size(&term), 1_998);
+        assert_eq!(history_size(&term), 39_998);
     }
 
     #[test]
