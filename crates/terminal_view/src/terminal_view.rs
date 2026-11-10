@@ -1709,6 +1709,8 @@ impl Item for TerminalView {
                 (icon, color, None)
             }
         };
+        // A rotation period, not an animation element: see the rendering cost
+        // in the `program_status` module of the `terminal` crate.
         let icon = Icon::new(icon).color(icon_color).when(spinning, |icon| {
             icon.with_rotation_period(Duration::from_secs(2))
         });

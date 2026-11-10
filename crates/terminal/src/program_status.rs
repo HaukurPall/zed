@@ -1,5 +1,14 @@
 //! What programs in a terminal report about their work: progress (OSC 9;4) and
 //! program status (OSC 7501, <https://www.superlogical.com/rex/docs/build/program-status>).
+//!
+//! Rendering cost: while a program reports that it is working, an icon rotates
+//! in its tab and in the sidebar, which can last for hours. As an animation
+//! element (`with_rotate_animation`) such an icon renders its view on every
+//! display frame, and a tab icon's view is the whole pane with the terminal
+//! grid: that kept a core a third busy while agents ran. So these icons use
+//! `Icon::with_rotation_period`, which GPUI applies as it presents a frame
+//! without rendering any view, and the wgpu renderer then redraws only around
+//! them. These reports are too expensive to show without both.
 
 /// Progress reported with OSC 9;4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
