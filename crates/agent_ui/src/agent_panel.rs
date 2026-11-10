@@ -978,6 +978,8 @@ struct AgentTerminal {
 }
 
 /// Shows what a terminal's program reports like the status of an agent thread.
+/// `Running` rotates an icon in the sidebar for as long as it lasts: see the
+/// rendering cost in the `program_status` module of the `terminal` crate.
 fn terminal_thread_status(status: Option<TerminalStatus>) -> AgentThreadStatus {
     match status {
         Some(TerminalStatus::Program(record)) => match record.state {
