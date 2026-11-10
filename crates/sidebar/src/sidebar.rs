@@ -53,12 +53,13 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, Divider, GradientFade, HighlightedLabel,
+    KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, Tab,
+    ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
+    render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -2448,7 +2449,7 @@ impl Sidebar {
                                 Icon::new(IconName::LoadCircle)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted)
-                                    .with_rotate_animation(2),
+                                    .with_rotation_period(Duration::from_secs(2)),
                             )
                         })
                         .when(waiting_thread_count > 0, |this| {

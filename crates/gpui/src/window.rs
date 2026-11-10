@@ -1287,6 +1287,10 @@ pub struct Window {
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Whether the presented scene's rotating sprites are due another turn,
+    /// which presenting it again gives them.
+    rotation_due: Rc<Cell<bool>>,
+    rotation_timer: Option<Task<()>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1337,6 +1341,10 @@ pub(crate) struct InputRateTracker {
 }
 
 const FRAME_INTERVAL_TOLERANCE: Duration = Duration::from_millis(1);
+
+/// How long after presenting rotating sprites they are turned again. A little
+/// under two refreshes at 60 Hz, so that every second refresh turns them.
+const ROTATION_FRAME_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Keeps throttled frames on a stable cadence despite callback delivery jitter.
 #[derive(Default)]
@@ -1736,6 +1744,7 @@ impl Window {
         profiler::journal::record_window_visibility(handle.window_id(), visibility);
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let rotation_due = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
 
@@ -1901,6 +1910,7 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let rotation_due = rotation_due.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
@@ -1965,6 +1975,7 @@ impl Window {
                     || has_next_frame_callbacks
                     || request_frame_options.require_presentation
                     || needs_present.get()
+                    || rotation_due.get()
                     || high_rate_input;
 
                 let should_throttle = !request_frame_options.require_presentation;
@@ -2042,6 +2053,7 @@ impl Window {
                 let should_draw = invalidator.is_dirty() || force_render;
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
+                    || rotation_due.get()
                     || high_rate_input;
                 if should_draw {
                     measure("frame duration", || {
@@ -2057,7 +2069,7 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present(cx);
                                 arena_clear_needed.clear(cx);
                             })
                             .with_context(|| {
@@ -2070,7 +2082,7 @@ impl Window {
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| window.present(cx))
                         .with_context(|| {
                             format!("presenting frame for window {:?}", handle.window_id())
                         })
@@ -2417,6 +2429,8 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
             needs_present,
+            rotation_due,
+            rotation_timer: None,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3929,12 +3943,30 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    fn present(&mut self, cx: &App) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
+        let rotates_sprites = self.rendered_frame.scene.rotate_sprites(elapsed);
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.rotation_due.set(false);
+        // Rotating sprites turn by presenting their scene again. A timer asks
+        // for that frame, so the turning doesn't run at the display's rate.
+        self.rotation_timer = rotates_sprites.then(|| {
+            self.spawn(cx, async move |cx| {
+                cx.background_executor()
+                    .timer(ROTATION_FRAME_INTERVAL)
+                    .await;
+                cx.update(|window, _| {
+                    window.rotation_due.set(true);
+                    window.platform_window.schedule_frame();
+                    window.invalidator.wake_platform();
+                })
+                .log_err();
+            })
+        });
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3948,9 +3980,9 @@ impl Window {
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
     #[cfg(all(test, feature = "profiler"))]
-    pub fn present_if_needed(&mut self) {
+    pub fn present_if_needed(&mut self, cx: &App) {
         if self.needs_present.get() {
-            self.present();
+            self.present(cx);
         }
     }
 
@@ -5268,7 +5300,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    rotation_period_ms: 0,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -5375,6 +5407,46 @@ impl Window {
         color: Hsla,
         cx: &App,
     ) -> Result<()> {
+        self.paint_svg_sprite(bounds, path, data, transformation, 0, color, cx)
+    }
+
+    /// Paint a monochrome SVG that turns clockwise around its center once per `period`,
+    /// which is kept in whole milliseconds; under one, the SVG doesn't turn.
+    ///
+    /// The window turns it each time it presents a frame, without rendering any view again.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_rotating_svg(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        data: Option<&[u8]>,
+        period: Duration,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        let period_ms = u32::try_from(period.as_millis()).unwrap_or(u32::MAX);
+        self.paint_svg_sprite(
+            bounds,
+            path,
+            data,
+            TransformationMatrix::unit(),
+            period_ms,
+            color,
+            cx,
+        )
+    }
+
+    fn paint_svg_sprite(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        data: Option<&[u8]>,
+        transformation: TransformationMatrix,
+        rotation_period_ms: u32,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -5417,7 +5489,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            rotation_period_ms,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),
@@ -9381,6 +9453,95 @@ mod tests {
 
         assert!(test_window.simulate_scheduled_frame());
         assert!(callback_ran.get());
+    }
+
+    #[gpui::test]
+    fn rotating_svg_turns_without_rendering_its_view(cx: &mut TestAppContext) {
+        struct Spinner {
+            renders: Rc<Cell<usize>>,
+        }
+
+        impl Render for Spinner {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                crate::svg()
+                    .data(
+                        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+                            <rect width="16" height="8"/>
+                        </svg>"#,
+                    )
+                    .size(px(16.))
+                    .text_color(hsla(0., 0., 0., 1.))
+                    .with_rotation_period(Duration::from_secs(2))
+            }
+        }
+
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            |_, _| Spinner { renders }
+        });
+        let test_window = cx.test_window(window.into());
+        // Inactive windows are frame-rate throttled, which would defer the
+        // ticks this test drives manually.
+        cx.update_window(window.into(), |_, window, _| window.active.set(true))
+            .unwrap();
+        let rotation = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, _| {
+                let sprites = &window.rendered_frame.scene.monochrome_sprites;
+                assert_eq!(sprites.len(), 1);
+                sprites[0].transformation.rotation_scale
+            })
+            .unwrap()
+        };
+        let assert_rotation = |actual: [[f32; 2]; 2], expected: [[f32; 2]; 2]| {
+            for (actual, expected) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+            }
+        };
+
+        assert!(test_window.simulate_scheduled_frame());
+        let renders_when_drawn = renders.get();
+        assert_rotation(rotation(cx), [[1., 0.], [0., 1.]]);
+
+        // The frame after a presentation has nothing to turn yet.
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!test_window.frame_scheduled());
+        assert_rotation(rotation(cx), [[1., 0.], [0., 1.]]);
+
+        // A quarter of the period later, the sprite has asked for a frame,
+        // which presents it a quarter turn on.
+        let frame_wakes = test_window.frame_wake_count();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(test_window.frame_wake_count() > frame_wakes);
+        assert!(
+            test_window.frame_scheduled(),
+            "a rotating sprite must request the frame that turns it"
+        );
+        assert!(test_window.simulate_scheduled_frame());
+        assert_rotation(rotation(cx), [[0., -1.], [1., 0.]]);
+        assert_eq!(renders.get(), renders_when_drawn);
+
+        // A presentation that only turned the sprite asks for the next turn too.
+        assert!(test_window.simulate_scheduled_frame());
+        assert!(!test_window.frame_scheduled());
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(test_window.simulate_scheduled_frame());
+        assert_rotation(rotation(cx), [[-1., 0.], [0., -1.]]);
+        assert_eq!(renders.get(), renders_when_drawn);
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        assert!(test_window.simulate_scheduled_frame());
+        assert_rotation(rotation(cx), [[1., 0.], [0., 1.]]);
+        assert!(test_window.simulate_scheduled_frame());
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(
+            !test_window.frame_scheduled(),
+            "a scene without rotating sprites must let the render loop park"
+        );
     }
 
     struct RootView {
