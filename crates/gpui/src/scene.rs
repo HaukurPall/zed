@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    time::Duration,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -50,11 +51,13 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    has_rotating_sprites: bool,
 }
 
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        self.has_rotating_sprites = false;
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -119,6 +122,7 @@ impl Scene {
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
+                self.has_rotating_sprites |= sprite.rotation_period_ms != 0;
                 self.monochrome_sprites.push(*sprite);
             }
             Primitive::SubpixelSprite(sprite) => {
@@ -160,6 +164,20 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    /// Turns each continuously rotating sprite to its angle after `elapsed`.
+    /// Returns whether the scene has any such sprite.
+    pub(crate) fn rotate_sprites(&mut self, elapsed: Duration) -> bool {
+        if !self.has_rotating_sprites {
+            return false;
+        }
+        for sprite in &mut self.monochrome_sprites {
+            if sprite.rotation_period_ms != 0 {
+                sprite.transformation = sprite.rotation_after(elapsed);
+            }
+        }
+        true
     }
 
     #[cfg_attr(
@@ -710,12 +728,27 @@ impl Default for TransformationMatrix {
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// When not zero, the sprite turns clockwise around its center once per
+    /// this many milliseconds. Shaders treat the field as padding.
+    pub rotation_period_ms: u32,
     pub tile: AtlasTile,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub transformation: TransformationMatrix,
+}
+
+impl MonochromeSprite {
+    fn rotation_after(&self, elapsed: Duration) -> TransformationMatrix {
+        let period = u128::from(self.rotation_period_ms) * 1_000_000;
+        // Reduce modulo the period first: f32 can't hold a long duration precisely.
+        let turn = (elapsed.as_nanos() % period) as f32 / period as f32;
+        let center = self.bounds.center();
+        TransformationMatrix::unit()
+            .translate(center)
+            .rotate(Radians(turn * std::f32::consts::TAU))
+            .translate(point(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)))
+    }
 }
 
 impl From<MonochromeSprite> for Primitive {

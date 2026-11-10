@@ -3,12 +3,13 @@ use std::{
     hash::{Hash, Hasher},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
-    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
+    App, Asset, Bounds, Element, GlobalElementId, Hitbox, Hsla, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString,
+    Size, StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -16,6 +17,7 @@ use gpui_util::ResultExt;
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
+    rotation_period: Option<Duration>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
     data: Option<Arc<[u8]>>,
@@ -28,6 +30,7 @@ pub fn svg() -> Svg {
     Svg {
         interactivity: Interactivity::new(),
         transformation: None,
+        rotation_period: None,
         path: None,
         external_path: None,
         data: None,
@@ -65,6 +68,14 @@ impl Svg {
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
         self.transformation = Some(transformation);
+        self
+    }
+
+    /// Turn the SVG clockwise around its center once per `period`, in place of
+    /// any transformation. The window turns it as it presents frames, so no
+    /// view is rendered again for the rotation.
+    pub fn with_rotation_period(mut self, period: Duration) -> Self {
+        self.rotation_period = Some(period);
         self
     }
 }
@@ -145,19 +156,26 @@ impl Element for Svg {
                         transformation.into_matrix(bounds.center(), window.scale_factor())
                     })
                     .unwrap_or_default();
+                let rotation_period = self.rotation_period.filter(|_| !cx.reduce_motion());
+                let paint = |path: &SharedString,
+                             data: Option<&[u8]>,
+                             color: Hsla,
+                             window: &mut Window,
+                             cx: &App| {
+                    match rotation_period {
+                        Some(period) => {
+                            window.paint_rotating_svg(bounds, path.clone(), data, period, color, cx)
+                        }
+                        None => {
+                            window.paint_svg(bounds, path.clone(), data, transformation, color, cx)
+                        }
+                    }
+                    .log_err();
+                };
 
                 if let Some((data, path)) = self.data.as_ref().zip(self.data_path.as_ref()) {
                     if let Some(color) = style.text.color {
-                        window
-                            .paint_svg(
-                                bounds,
-                                path.clone(),
-                                Some(&**data),
-                                transformation,
-                                color,
-                                cx,
-                            )
-                            .log_err();
+                        paint(path, Some(&**data), color, window, cx);
                     }
                 } else if let Some((path, color)) =
                     self.external_path.as_ref().zip(style.text.color)
@@ -169,20 +187,9 @@ impl Element for Svg {
                         return;
                     };
 
-                    window
-                        .paint_svg(
-                            bounds,
-                            path.clone(),
-                            Some(&bytes),
-                            transformation,
-                            color,
-                            cx,
-                        )
-                        .log_err();
+                    paint(path, Some(&bytes), color, window, cx);
                 } else if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
-                    window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
-                        .log_err();
+                    paint(path, None, color, window, cx);
                 }
             },
         )
