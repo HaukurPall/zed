@@ -2446,6 +2446,8 @@ impl Sidebar {
                     .when(is_collapsed, |this| {
                         this.when(has_running_threads, |this| {
                             this.child(
+                                // A rotation period, as in `ThreadItem`: the
+                                // icon shows for as long as a thread runs.
                                 Icon::new(IconName::LoadCircle)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted)

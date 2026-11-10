@@ -342,6 +342,8 @@ impl RenderOnce for ThreadItem {
         let icon = if self.status == AgentThreadStatus::Running {
             icon_container()
                 .child(
+                    // A rotation period: an animation element would render the
+                    // sidebar on every frame for as long as the thread runs.
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::Small)
                         .color(Color::Muted)
