@@ -3,14 +3,13 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges,
-    GpuSpecs, Hsla, Path, Point, PrimitiveBatch, Quad, Rgba, ScaledPixels, Scene, Shadow, Size,
-    TransformationMatrix, get_gamma_correction_ratios, point,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -20,10 +19,6 @@ use std::sync::Arc;
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
-
-/// Each damaged region of a retained frame takes a pass of its own, which
-/// goes over the scene's primitives. A frame with more regions is drawn in full.
-const MAX_DAMAGE_REGIONS: usize = 8;
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -130,8 +125,6 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
-    /// Quads drawn without blending, to clear part of a target.
-    clear_quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -201,15 +194,6 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-    retained_frame: Option<RetainedFrame>,
-}
-
-/// A frame kept in a texture, so that the next one can redraw only what changed.
-struct RetainedFrame {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    /// The [`Scene::content_id`] of the scene the texture shows.
-    content_id: NonZeroU64,
 }
 
 struct CachedTextureBindGroup {
@@ -223,7 +207,6 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
-        self.retained_frame = None;
     }
 }
 
@@ -242,10 +225,6 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
-    /// The content of the previous presented frame, if it could be retained.
-    previous_content_id: Option<NonZeroU64>,
-    /// Whether the previous presented frame had the content of the one before.
-    previous_frame_repeated: bool,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -481,11 +460,8 @@ impl WgpuRenderer {
             );
         }
 
-        // Copying lets a retained frame reach the surface.
-        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
-            | (surface_caps.usages & wgpu::TextureUsages::COPY_DST);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
@@ -845,23 +821,6 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let clear_quads = create_pipeline(
-            "clear_quads",
-            "vs_quad",
-            "fs_quad",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -997,7 +956,6 @@ impl WgpuRendererCore {
 
         WgpuPipelines {
             quads,
-            clear_quads,
             shadows,
             path_rasterization,
             paths,
@@ -1105,9 +1063,6 @@ impl WgpuRenderer {
         if let Some(ref texture) = resources.path_msaa_texture {
             texture.destroy();
         }
-        if let Some(ref frame) = resources.retained_frame {
-            frame.texture.destroy();
-        }
 
         // Invalidate intermediate textures - they will be lazily recreated
         // in draw() after we confirm the surface is healthy. This avoids
@@ -1123,7 +1078,6 @@ impl WgpuRenderer {
         self.is_bgr = is_bgr;
         if let Some(core) = self.core_mut() {
             core.is_bgr = is_bgr;
-            core.resources.retained_frame = None;
         }
     }
 
@@ -1152,7 +1106,6 @@ impl WgpuRenderer {
             core.dual_source_blending,
             core.uses_webgl_instance_data,
         );
-        resources.retained_frame = None;
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1216,8 +1169,6 @@ impl WgpuRenderer {
                 .observe_error(&mut self.observed_error_generation)
         }) {
             self.failed_frame_count += 1;
-            // Whatever the failed frame left in a retained frame can't be trusted.
-            core.resources.retained_frame = None;
             log::error!(
                 "GPU error during frame (failure {} of 10): {error}",
                 self.failed_frame_count
@@ -1258,11 +1209,21 @@ impl WgpuRenderer {
             }
         };
 
+        // The acquired texture is the authority on frame dimensions; the surface
+        // configuration is only a request.
+        let size = Size {
+            width: DevicePixels(frame.texture.width() as i32),
+            height: DevicePixels(frame.texture.height() as i32),
+        };
+        let frame_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
-        if let Err(error) = core.render_presented_frame(
+        if let Err(error) = core.render_frame(
             scene,
-            &frame.texture,
+            &frame_view,
+            size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
         ) {
@@ -1416,7 +1377,6 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
-                retained_frame: None,
             },
             atlas,
             path_globals_offset,
@@ -1431,8 +1391,6 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
-            previous_content_id: None,
-            previous_frame_repeated: false,
         }
     }
 
@@ -1480,7 +1438,14 @@ impl WgpuRendererCore {
         resources.path_msaa_view = path_msaa_view;
     }
 
-    fn check_target_size(&self, size: Size<DevicePixels>) -> Result<()> {
+    fn render_frame(
+        &mut self,
+        scene: &Scene,
+        target_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        premultiplied_alpha: bool,
+        clear_color: wgpu::Color,
+    ) -> Result<wgpu::SubmissionIndex> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
             "invalid render target size: {size:?}"
@@ -1491,144 +1456,6 @@ impl WgpuRendererCore {
             "render target size {size:?} exceeds maximum texture dimension {}",
             self.max_texture_size
         );
-        Ok(())
-    }
-
-    /// Renders `scene` into `target`, a texture that doesn't keep its contents
-    /// from one frame to the next, as a surface's doesn't.
-    fn render_presented_frame(
-        &mut self,
-        scene: &Scene,
-        target: &wgpu::Texture,
-        premultiplied_alpha: bool,
-        clear_color: wgpu::Color,
-    ) -> Result<()> {
-        // The texture is the authority on frame dimensions; a surface's
-        // configuration is only a request.
-        let size = Size {
-            width: DevicePixels(target.width() as i32),
-            height: DevicePixels(target.height() as i32),
-        };
-        // A frame that only turns sprites can be made from the frame before
-        // it, if that one is kept and can be copied into the target.
-        let damage = rotating_sprite_damage(scene, size)
-            .filter(|_| target.usage().contains(wgpu::TextureUsages::COPY_DST))
-            .unwrap_or_default();
-        let content_id = scene.content_id().filter(|_| !damage.is_empty());
-        let repeats_content = content_id.is_some() && content_id == self.previous_content_id;
-        // New content is kept only after a frame that repeated its content:
-        // while every frame brings new content, keeping them only costs copies.
-        let retained_content_id =
-            content_id.filter(|_| repeats_content || self.previous_frame_repeated);
-        self.previous_content_id = content_id;
-        self.previous_frame_repeated = repeats_content;
-
-        let Some(content_id) = retained_content_id else {
-            self.resources.retained_frame = None;
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            self.render_frame(scene, &view, size, premultiplied_alpha, clear_color, None)?;
-            return Ok(());
-        };
-        let retained = self.render_retained_frame(
-            scene,
-            size,
-            premultiplied_alpha,
-            clear_color,
-            content_id,
-            &damage,
-        )?;
-        self.copy_texture(&retained, target);
-        Ok(())
-    }
-
-    /// Renders `scene`, whose content is `content_id`, into a texture that is
-    /// kept between frames, and returns the texture. When the texture already
-    /// shows that content, only `damage` is drawn again.
-    fn render_retained_frame(
-        &mut self,
-        scene: &Scene,
-        size: Size<DevicePixels>,
-        premultiplied_alpha: bool,
-        clear_color: wgpu::Color,
-        content_id: NonZeroU64,
-        damage: &[Bounds<ScaledPixels>],
-    ) -> Result<wgpu::Texture> {
-        self.check_target_size(size)?;
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        // Taken, so that a frame that fails doesn't leave its texture behind.
-        let retained = self
-            .resources
-            .retained_frame
-            .take()
-            .filter(|frame| frame.texture.width() == width && frame.texture.height() == height);
-        let (texture, view, damage) = match retained {
-            Some(frame) => {
-                let damage = (frame.content_id == content_id).then_some(damage);
-                (frame.texture, frame.view, damage)
-            }
-            None => {
-                let texture = self
-                    .resources
-                    .device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some("retained_frame"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: self.target_format,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::COPY_SRC,
-                        view_formats: &[],
-                    });
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                (texture, view, None)
-            }
-        };
-
-        self.render_frame(scene, &view, size, premultiplied_alpha, clear_color, damage)?;
-        self.resources.retained_frame = Some(RetainedFrame {
-            texture: texture.clone(),
-            view,
-            content_id,
-        });
-        Ok(texture)
-    }
-
-    fn copy_texture(&self, source: &wgpu::Texture, destination: &wgpu::Texture) {
-        let resources = self.resources();
-        let mut encoder =
-            resources
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("texture_copy_encoder"),
-                });
-        encoder.copy_texture_to_texture(
-            source.as_image_copy(),
-            destination.as_image_copy(),
-            source.size(),
-        );
-        resources.queue.submit(std::iter::once(encoder.finish()));
-    }
-
-    /// Draws `scene` into the target, after clearing it. With `damage`, the
-    /// target is taken to show the scene already, and only those parts of it
-    /// are cleared and drawn.
-    fn render_frame(
-        &mut self,
-        scene: &Scene,
-        target_view: &wgpu::TextureView,
-        size: Size<DevicePixels>,
-        premultiplied_alpha: bool,
-        clear_color: wgpu::Color,
-        damage: Option<&[Bounds<ScaledPixels>]>,
-    ) -> Result<wgpu::SubmissionIndex> {
-        self.check_target_size(size)?;
 
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size);
@@ -1665,73 +1492,11 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color, damage)
+        self.record_frame(scene, target_view, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
             })
-    }
-
-    fn begin_main_pass<'encoder>(
-        encoder: &'encoder mut wgpu::CommandEncoder,
-        label: &'static str,
-        frame_view: &wgpu::TextureView,
-        load: wgpu::LoadOp<wgpu::Color>,
-        region: Option<Bounds<ScaledPixels>>,
-    ) -> wgpu::RenderPass<'encoder> {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some(label),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        if let Some(region) = region {
-            pass.set_scissor_rect(
-                region.origin.x.0 as u32,
-                region.origin.y.0 as u32,
-                region.size.width.0 as u32,
-                region.size.height.0 as u32,
-            );
-        }
-        pass
-    }
-
-    /// A quad that fills any target with `color` when drawn without blending.
-    /// It matches a pass's clear for black and for transparent, which is what
-    /// frames are cleared to.
-    fn clear_quad(&self, color: wgpu::Color) -> Quad {
-        let extent = ScaledPixels(self.max_texture_size as f32);
-        let bounds = Bounds {
-            origin: Point::default(),
-            size: Size {
-                width: extent,
-                height: extent,
-            },
-        };
-        let color = Hsla::from(Rgba {
-            r: color.r as f32,
-            g: color.g as f32,
-            b: color.b as f32,
-            a: color.a as f32,
-        });
-        Quad {
-            order: 0,
-            border_style: BorderStyle::default(),
-            bounds,
-            content_mask: ContentMask { bounds },
-            background: color.into(),
-            border_color: color,
-            corner_radii: Corners::default(),
-            border_widths: Edges::default(),
-        }
     }
 
     fn record_frame(
@@ -1739,7 +1504,6 @@ impl WgpuRendererCore {
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
-        damage: Option<&[Bounds<ScaledPixels>]>,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -1765,75 +1529,39 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        // The whole target, or each damaged part of it in turn.
-        let regions: SmallVec<[Option<Bounds<ScaledPixels>>; 4]> = match damage {
-            Some(damage) => damage.iter().copied().map(Some).collect(),
-            None => smallvec![None],
-        };
-        let clear_quad = match damage {
-            Some(_) => Some(self.write_instance_binding(
-                "clear_quad_bind_group",
-                &mut instance_offset,
-                &[self.clear_quad(clear_color)],
-            )?),
-            None => None,
-        };
-
-        for region in regions {
-            let load = match region {
-                Some(_) => wgpu::LoadOp::Load,
-                None => wgpu::LoadOp::Clear(clear_color),
-            };
-            let mut pass =
-                Self::begin_main_pass(&mut encoder, "main_pass", frame_view, load, region);
-            if let Some(clear_quad) = &clear_quad {
-                self.draw_instances(
-                    clear_quad,
-                    &self.resources().pipelines.clear_quads,
-                    0..1,
-                    &mut pass,
-                );
-            }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
 
             for batch in scene.batches() {
                 match batch {
-                    PrimitiveBatch::Quads(range) => {
-                        let runs = instance_runs(&scene.quads, range, region, |quad, region| {
-                            quad.bounds.intersects(region)
-                        });
-                        for run in runs {
-                            self.draw_instances(
-                                &instance_bindings.quads,
-                                &self.resources().pipelines.quads,
-                                run,
-                                &mut pass,
-                            );
-                        }
-                    }
-                    PrimitiveBatch::Shadows(range) => {
-                        let runs =
-                            instance_runs(&scene.shadows, range, region, shadow_paints_within);
-                        for run in runs {
-                            self.draw_instances(
-                                &instance_bindings.shadows,
-                                &self.resources().pipelines.shadows,
-                                run,
-                                &mut pass,
-                            );
-                        }
-                    }
+                    PrimitiveBatch::Quads(range) => self.draw_instances(
+                        &instance_bindings.quads,
+                        &self.resources().pipelines.quads,
+                        instance_range(range),
+                        &mut pass,
+                    ),
+                    PrimitiveBatch::Shadows(range) => self.draw_instances(
+                        &instance_bindings.shadows,
+                        &self.resources().pipelines.shadows,
+                        instance_range(range),
+                        &mut pass,
+                    ),
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
                         if paths.is_empty() {
-                            continue;
-                        }
-                        // Rasterizing paths clears a whole intermediate texture.
-                        let outside_region = region.is_some_and(|region| {
-                            !paths
-                                .iter()
-                                .any(|path| path.clipped_bounds().intersects(&region))
-                        });
-                        if outside_region {
                             continue;
                         }
 
@@ -1844,13 +1572,20 @@ impl WgpuRendererCore {
                             &mut instance_offset,
                         )?;
 
-                        pass = Self::begin_main_pass(
-                            &mut encoder,
-                            "main_pass_continued",
-                            frame_view,
-                            wgpu::LoadOp::Load,
-                            region,
-                        );
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -1860,79 +1595,43 @@ impl WgpuRendererCore {
                             )?;
                         }
                     }
-                    PrimitiveBatch::Underlines(range) => {
-                        let runs =
-                            instance_runs(&scene.underlines, range, region, |underline, region| {
-                                underline.bounds.intersects(region)
-                            });
-                        for run in runs {
-                            self.draw_instances(
-                                &instance_bindings.underlines,
-                                &self.resources().pipelines.underlines,
-                                run,
-                                &mut pass,
-                            );
-                        }
-                    }
+                    PrimitiveBatch::Underlines(range) => self.draw_instances(
+                        &instance_bindings.underlines,
+                        &self.resources().pipelines.underlines,
+                        instance_range(range),
+                        &mut pass,
+                    ),
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                        let runs = instance_runs(
-                            &scene.monochrome_sprites,
-                            range,
-                            region,
-                            |sprite, region| {
-                                sprite_paints_within(&sprite.bounds, &sprite.transformation, region)
-                            },
-                        );
-                        for run in runs {
-                            self.draw_sprites(
-                                &instance_bindings.monochrome_sprites,
-                                texture_id,
-                                &self.resources().pipelines.mono_sprites,
-                                run,
-                                &mut pass,
-                            )?;
-                        }
+                        self.draw_sprites(
+                            &instance_bindings.monochrome_sprites,
+                            texture_id,
+                            &self.resources().pipelines.mono_sprites,
+                            instance_range(range),
+                            &mut pass,
+                        )?;
                     }
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let runs = instance_runs(
-                            &scene.subpixel_sprites,
-                            range,
-                            region,
-                            |sprite, region| {
-                                sprite_paints_within(&sprite.bounds, &sprite.transformation, region)
-                            },
-                        );
                         let resources = self.resources();
-                        for run in runs {
-                            self.draw_sprites(
-                                &instance_bindings.subpixel_sprites,
-                                texture_id,
-                                resources
-                                    .pipelines
-                                    .subpixel_sprites
-                                    .as_ref()
-                                    .unwrap_or(&resources.pipelines.mono_sprites),
-                                run,
-                                &mut pass,
-                            )?;
-                        }
+                        self.draw_sprites(
+                            &instance_bindings.subpixel_sprites,
+                            texture_id,
+                            resources
+                                .pipelines
+                                .subpixel_sprites
+                                .as_ref()
+                                .unwrap_or(&resources.pipelines.mono_sprites),
+                            instance_range(range),
+                            &mut pass,
+                        )?;
                     }
                     PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                        let runs = instance_runs(
-                            &scene.polychrome_sprites,
-                            range,
-                            region,
-                            |sprite, region| sprite.bounds.intersects(region),
-                        );
-                        for run in runs {
-                            self.draw_sprites(
-                                &instance_bindings.polychrome_sprites,
-                                texture_id,
-                                &self.resources().pipelines.poly_sprites,
-                                run,
-                                &mut pass,
-                            )?;
-                        }
+                        self.draw_sprites(
+                            &instance_bindings.polychrome_sprites,
+                            texture_id,
+                            &self.resources().pipelines.poly_sprites,
+                            instance_range(range),
+                            &mut pass,
+                        )?;
                     }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
@@ -2737,25 +2436,19 @@ impl WgpuHeadlessRenderer {
             .view
             .clone();
         self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK, None)?;
+            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
         Ok(())
     }
 
     /// Copies the current render target back to the CPU. Dimensions come from the
     /// target texture itself, so the copy can never disagree with what was rendered.
     fn read_image(&mut self) -> anyhow::Result<image::RgbaImage> {
-        let texture = self
+        let target = self
             .render_target
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
-            .texture
-            .clone();
-        self.read_texture(&texture)
-    }
-
-    fn read_texture(&mut self, texture: &wgpu::Texture) -> anyhow::Result<image::RgbaImage> {
-        let width = texture.width();
-        let height = texture.height();
+            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
+        let width = target.texture.width();
+        let height = target.texture.height();
         let bytes_per_row = width
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("Headless render target row size overflowed"))?;
@@ -2789,7 +2482,7 @@ impl WgpuHeadlessRenderer {
                 });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture,
+                texture: &target.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -2886,92 +2579,6 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
-/// The runs of `primitives[range]` that can paint within `region`, as
-/// instance ranges. Without a region, that is all of the range.
-fn instance_runs<T>(
-    primitives: &[T],
-    range: Range<usize>,
-    region: Option<Bounds<ScaledPixels>>,
-    paints_within: impl Fn(&T, &Bounds<ScaledPixels>) -> bool,
-) -> SmallVec<[Range<u32>; 2]> {
-    let Some(region) = region else {
-        return smallvec![instance_range(range)];
-    };
-    let mut runs = SmallVec::new();
-    let mut run_start = None;
-    for (index, primitive) in range.clone().zip(&primitives[range.clone()]) {
-        if paints_within(primitive, &region) {
-            run_start.get_or_insert(index);
-        } else if let Some(start) = run_start.take() {
-            runs.push(instance_range(start..index));
-        }
-    }
-    if let Some(start) = run_start {
-        runs.push(instance_range(start..range.end));
-    }
-    runs
-}
-
-/// A transformed sprite isn't confined to its bounds.
-fn sprite_paints_within(
-    bounds: &Bounds<ScaledPixels>,
-    transformation: &TransformationMatrix,
-    region: &Bounds<ScaledPixels>,
-) -> bool {
-    *transformation != TransformationMatrix::unit() || bounds.intersects(region)
-}
-
-/// A shadow's blur reaches beyond its bounds, and an inset shadow is drawn
-/// within its element's.
-fn shadow_paints_within(shadow: &Shadow, region: &Bounds<ScaledPixels>) -> bool {
-    shadow
-        .bounds
-        .dilate(shadow.blur_radius * 3.)
-        .intersects(region)
-        || shadow.element_bounds.intersects(region)
-}
-
-/// Regions of a target of `size`, on whole pixels, that between them hold
-/// whatever the scene's rotating sprites paint. `None` when that takes more
-/// than [`MAX_DAMAGE_REGIONS`].
-fn rotating_sprite_damage(
-    scene: &Scene,
-    size: Size<DevicePixels>,
-) -> Option<SmallVec<[Bounds<ScaledPixels>; 4]>> {
-    let width = size.width.0 as f32;
-    let height = size.height.0 as f32;
-    let area = |bounds: &Bounds<ScaledPixels>| bounds.size.width.0 * bounds.size.height.0;
-    // A region costs a pass over the scene, and a pixel costs very little, so
-    // sprites share a region while it stays a small part of the target.
-    let shared_region_area = width * height / 16.;
-
-    let mut regions = SmallVec::new();
-    for bounds in scene.rotating_sprite_bounds() {
-        let left = bounds.left().0.floor().max(0.);
-        let top = bounds.top().0.floor().max(0.);
-        let right = bounds.right().0.ceil().min(width);
-        let bottom = bounds.bottom().0.ceil().min(height);
-        if left >= right || top >= bottom {
-            continue;
-        }
-        let mut region = Bounds::from_corners(
-            point(ScaledPixels(left), ScaledPixels(top)),
-            point(ScaledPixels(right), ScaledPixels(bottom)),
-        );
-        while let Some(index) = regions
-            .iter()
-            .position(|other| area(&region.union(other)) <= shared_region_area)
-        {
-            region = region.union(&regions.swap_remove(index));
-        }
-        regions.push(region);
-        if regions.len() > MAX_DAMAGE_REGIONS {
-            return None;
-        }
-    }
-    Some(regions)
-}
-
 #[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
@@ -3036,16 +2643,13 @@ impl RenderingParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    use gpui::{
-        AtlasKey, DevicePixels, PathBuilder, PlatformHeadlessRenderer, Primitive, RenderSvgParams,
-        Scene, px,
-    };
     use gpui::{
         BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite,
         PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, Underline, linear_color_stop,
         linear_gradient,
     };
+    #[cfg(target_os = "linux")]
+    use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -3194,451 +2798,6 @@ mod tests {
         // Rejection must leave the renderer usable.
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
-        Bounds {
-            origin: point(ScaledPixels(x), ScaledPixels(y)),
-            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
-        }
-    }
-
-    /// Turns the rotating sprites, as a window does before it presents a frame.
-    #[cfg(target_os = "linux")]
-    fn turn_sprites(scene: &mut Scene, turns: f32) {
-        for sprite in &mut scene.monochrome_sprites {
-            if sprite.rotation_period_ms != 0 {
-                sprite.transformation = turned_around_center(sprite.bounds, turns);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn turned_around_center(bounds: Bounds<ScaledPixels>, turns: f32) -> TransformationMatrix {
-        let center = bounds.center();
-        TransformationMatrix::unit()
-            .translate(center)
-            .rotate(gpui::Radians(turns * std::f32::consts::TAU))
-            .translate(point(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn triangle(
-        corners: [(f32, f32); 3],
-        content_mask: Bounds<ScaledPixels>,
-    ) -> anyhow::Result<Path<ScaledPixels>> {
-        let [first, second, third] = corners.map(|(x, y)| point(px(x), px(y)));
-        let mut builder = PathBuilder::fill();
-        builder.move_to(first);
-        builder.line_to(second);
-        builder.line_to(third);
-        builder.close();
-        let mut path = builder.build()?.scale(1.0);
-        path.color = gpui::yellow().opacity(0.6).into();
-        path.content_mask = ContentMask {
-            bounds: content_mask,
-        };
-        Ok(path)
-    }
-
-    /// Frames drawn the way a window's are: into a texture that doesn't keep
-    /// its contents from one frame to the next.
-    #[cfg(target_os = "linux")]
-    struct PresentedFrames {
-        renderer: WgpuHeadlessRenderer,
-        target: wgpu::Texture,
-        premultiplied_alpha: bool,
-        clear_color: wgpu::Color,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl PresentedFrames {
-        fn new(
-            alpha_mode: wgpu::CompositeAlphaMode,
-            clear_color: wgpu::Color,
-        ) -> anyhow::Result<Self> {
-            let mut renderer = WgpuHeadlessRenderer::new()?;
-            let atlas = renderer.core.atlas.clone();
-            let format = renderer.core.target_format;
-            renderer.core = WgpuRendererCore::new(&renderer.context, atlas, format, alpha_mode);
-            let target = renderer
-                .core
-                .resources
-                .device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("presented_frame"),
-                    size: wgpu::Extent3d {
-                        width: 64,
-                        height: 48,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-            Ok(Self {
-                renderer,
-                target,
-                premultiplied_alpha: alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
-                clear_color,
-            })
-        }
-
-        fn opaque() -> anyhow::Result<Self> {
-            Self::new(wgpu::CompositeAlphaMode::Opaque, wgpu::Color::BLACK)
-        }
-
-        fn whole(&self) -> Bounds<ScaledPixels> {
-            scaled_bounds(0., 0., 64., 48.)
-        }
-
-        /// A sprite whose mask fades across its left half and is empty in its
-        /// right half, so that its angle shows.
-        fn rotating_sprite(
-            &self,
-            bounds: Bounds<ScaledPixels>,
-            content_mask: Bounds<ScaledPixels>,
-        ) -> anyhow::Result<MonochromeSprite> {
-            let tile_size = device_size(16, 16);
-            let mask: Vec<u8> = (0..16 * 16)
-                .map(|index| match index % 16 {
-                    column @ 0..8 => 31 + column as u8 * 32,
-                    _ => 0,
-                })
-                .collect();
-            let tile = self
-                .renderer
-                .sprite_atlas()
-                .get_or_insert_with(
-                    AtlasKey::Svg(RenderSvgParams {
-                        path: "fading half".into(),
-                        size: tile_size,
-                    }),
-                    &mut || Ok(Some((tile_size, mask.clone().into()))),
-                )?
-                .ok_or_else(|| anyhow::anyhow!("the atlas built no tile"))?;
-            Ok(MonochromeSprite {
-                order: 0,
-                rotation_period_ms: 1000,
-                tile,
-                bounds,
-                content_mask: ContentMask {
-                    bounds: content_mask,
-                },
-                color: gpui::white(),
-                transformation: TransformationMatrix::unit(),
-            })
-        }
-
-        fn present(&mut self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
-            self.renderer.core.render_presented_frame(
-                scene,
-                &self.target,
-                self.premultiplied_alpha,
-                self.clear_color,
-            )?;
-            self.renderer.read_texture(&self.target)
-        }
-
-        fn draw_from_scratch(&mut self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
-            let view = self
-                .target
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderer.core.render_frame(
-                scene,
-                &view,
-                device_size(64, 48),
-                self.premultiplied_alpha,
-                self.clear_color,
-                None,
-            )?;
-            self.renderer.read_texture(&self.target)
-        }
-
-        fn retains_frame(&self) -> bool {
-            self.renderer.core.resources.retained_frame.is_some()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    const TOO_MANY_REGIONS: &str = "more regions than are redrawn";
-
-    #[cfg(target_os = "linux")]
-    fn scene_of(primitives: impl IntoIterator<Item = Primitive>) -> Scene {
-        let mut scene = Scene::default();
-        for primitive in primitives {
-            scene.insert_primitive(primitive);
-        }
-        scene.finish();
-        scene
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn presented_frames_match_frames_drawn_from_scratch() -> anyhow::Result<()> {
-        for (alpha_mode, clear_color) in [
-            (wgpu::CompositeAlphaMode::Opaque, wgpu::Color::BLACK),
-            (wgpu::CompositeAlphaMode::Opaque, wgpu::Color::TRANSPARENT),
-            (
-                wgpu::CompositeAlphaMode::PreMultiplied,
-                wgpu::Color::TRANSPARENT,
-            ),
-        ] {
-            let mut frames = PresentedFrames::new(alpha_mode, clear_color)?;
-            let whole = frames.whole();
-            let middle = scaled_bounds(20., 16., 16., 16.);
-            let sprite = frames.rotating_sprite(middle, whole)?;
-            let background = |color: Hsla| Primitive::from(solid_quad(0., 0., 64., 48., color));
-
-            let scenes = [
-                ("no background", scene_of([sprite.into()])),
-                (
-                    "translucent background",
-                    scene_of([background(gpui::red().opacity(0.4)), sprite.into()]),
-                ),
-                (
-                    "fractional bounds",
-                    scene_of([
-                        background(gpui::blue()),
-                        MonochromeSprite {
-                            bounds: scaled_bounds(10.3, 10.7, 30.2, 5.1),
-                            ..sprite
-                        }
-                        .into(),
-                    ]),
-                ),
-                (
-                    "partly off the target",
-                    scene_of([
-                        background(gpui::blue().opacity(0.5)),
-                        MonochromeSprite {
-                            bounds: scaled_bounds(-7., -5., 16., 16.),
-                            ..sprite
-                        }
-                        .into(),
-                        MonochromeSprite {
-                            bounds: scaled_bounds(55., 40., 16., 16.),
-                            ..sprite
-                        }
-                        .into(),
-                    ]),
-                ),
-                (
-                    "content mask",
-                    scene_of([
-                        background(gpui::blue()),
-                        frames
-                            .rotating_sprite(middle, scaled_bounds(22.5, 18.5, 7., 9.))?
-                            .into(),
-                    ]),
-                ),
-                (
-                    "overlapping sprites",
-                    scene_of([
-                        background(gpui::green().opacity(0.3)),
-                        sprite.into(),
-                        MonochromeSprite {
-                            bounds: scaled_bounds(26., 20., 16., 16.),
-                            ..sprite
-                        }
-                        .into(),
-                    ]),
-                ),
-                (
-                    "path over the sprite",
-                    scene_of([
-                        background(gpui::blue()),
-                        sprite.into(),
-                        triangle([(15., 15.), (40., 18.), (22., 40.)], whole)?.into(),
-                    ]),
-                ),
-                (
-                    "path beside the sprite",
-                    scene_of([
-                        background(gpui::blue()),
-                        triangle([(50., 30.), (60., 30.), (55., 45.)], whole)?.into(),
-                        sprite.into(),
-                    ]),
-                ),
-                (
-                    "primitives that reach the sprite",
-                    scene_of([
-                        background(gpui::blue()),
-                        Shadow {
-                            order: 0,
-                            blur_radius: ScaledPixels(4.),
-                            bounds: scaled_bounds(42., 18., 10., 10.),
-                            corner_radii: Corners::default(),
-                            content_mask: ContentMask { bounds: whole },
-                            color: gpui::black(),
-                            element_bounds: scaled_bounds(42., 18., 10., 10.),
-                            element_corner_radii: Corners::default(),
-                            inset: 0,
-                            pad: 0,
-                        }
-                        .into(),
-                        solid_quad(8., 20., 12., 30., gpui::green().opacity(0.5)).into(),
-                        sprite.into(),
-                        Underline {
-                            order: 0,
-                            pad: 0,
-                            bounds: scaled_bounds(18., 30., 30., 2.),
-                            content_mask: ContentMask { bounds: whole },
-                            color: gpui::white(),
-                            thickness: ScaledPixels(2.),
-                            wavy: false.into(),
-                        }
-                        .into(),
-                        // Tilted, so that a corner reaches beyond its bounds.
-                        MonochromeSprite {
-                            rotation_period_ms: 0,
-                            bounds: scaled_bounds(38., 2., 16., 16.),
-                            transformation: turned_around_center(
-                                scaled_bounds(38., 2., 16., 16.),
-                                0.125,
-                            ),
-                            ..sprite
-                        }
-                        .into(),
-                        solid_quad(24., 20., 30., 6., gpui::black().opacity(0.5)).into(),
-                    ]),
-                ),
-                (
-                    "sprites that share regions",
-                    scene_of(std::iter::once(background(gpui::blue())).chain((0..8).map(
-                        |index| {
-                            let x = (2 + index * 7) as f32;
-                            MonochromeSprite {
-                                bounds: scaled_bounds(x, 4., 4., 4.),
-                                ..sprite
-                            }
-                            .into()
-                        },
-                    ))),
-                ),
-                (
-                    TOO_MANY_REGIONS,
-                    // Each too large to share a region with another.
-                    scene_of(std::iter::once(background(gpui::blue())).chain((0..9).map(
-                        |index| {
-                            let x = (index % 5 * 12) as f32;
-                            let y = (index / 5 * 20) as f32;
-                            MonochromeSprite {
-                                bounds: scaled_bounds(x, y, 12., 12.),
-                                ..sprite
-                            }
-                            .into()
-                        },
-                    ))),
-                ),
-            ];
-
-            for (name, mut scene) in scenes {
-                let within_regions = name != TOO_MANY_REGIONS;
-                frames.present(&scene)?;
-                for step in 1..12 {
-                    turn_sprites(&mut scene, step as f32 * 0.093);
-                    let presented = frames.present(&scene)?;
-                    assert_eq!(frames.retains_frame(), within_regions, "{name}");
-                    assert!(
-                        presented == frames.draw_from_scratch(&scene)?,
-                        "{name}, {alpha_mode:?}, step {step}: \
-                         a presented frame should match one drawn from scratch"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn rotating_sprites_near_each_other_share_a_damage_region() -> anyhow::Result<()> {
-        let frames = PresentedFrames::opaque()?;
-        let whole = scaled_bounds(0., 0., 640., 480.);
-        let sprite = frames.rotating_sprite(scaled_bounds(0., 0., 16., 16.), whole)?;
-        let row = (0..4).map(|index| scaled_bounds(10. + index as f32 * 100., 10., 16., 16.));
-        let far_corner = scaled_bounds(600., 440., 16., 16.);
-        let scene = scene_of(
-            row.chain([far_corner])
-                .map(|bounds| MonochromeSprite { bounds, ..sprite }.into()),
-        );
-
-        let damage = rotating_sprite_damage(&scene, device_size(640, 480))
-            .ok_or_else(|| anyhow::anyhow!("too many regions"))?;
-        assert_eq!(damage.len(), 2);
-        for bounds in scene.rotating_sprite_bounds() {
-            assert!(
-                damage
-                    .iter()
-                    .any(|region| region.intersect(&bounds) == bounds),
-                "{bounds:?} should lie within a region"
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn retained_frame_is_redrawn_only_around_rotating_sprites() -> anyhow::Result<()> {
-        let mut frames = PresentedFrames::opaque()?;
-        let sprite = frames.rotating_sprite(scaled_bounds(20., 16., 16., 16.), frames.whole())?;
-        let mut scene = scene_of([
-            solid_quad(0., 0., 64., 48., gpui::blue()).into(),
-            sprite.into(),
-        ]);
-
-        let upright = frames.present(&scene)?;
-        turn_sprites(&mut scene, 0.13);
-        let turned = frames.present(&scene)?;
-        assert!(turned != upright, "the sprite should have turned");
-
-        // A change that the content id doesn't announce shows only where the
-        // frame is drawn again: around the sprite.
-        scene.quads[0].background = gpui::red().into();
-        turn_sprites(&mut scene, 0.26);
-        let turned = frames.present(&scene)?;
-        assert_pixel(&turned, 17, 13, RED);
-        assert_pixel(&turned, 60, 44, BLUE);
-
-        scene.finish();
-        let finished = frames.present(&scene)?;
-        assert_pixel(&finished, 60, 44, RED);
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn frames_are_retained_only_while_content_repeats() -> anyhow::Result<()> {
-        let mut frames = PresentedFrames::opaque()?;
-        let sprite = frames.rotating_sprite(scaled_bounds(20., 16., 16., 16.), frames.whole())?;
-        let background = || Primitive::from(solid_quad(0., 0., 64., 48., gpui::blue()));
-        let first = scene_of([background(), sprite.into()]);
-        let second = scene_of([background(), sprite.into()]);
-        let third = scene_of([background(), sprite.into()]);
-        let still = scene_of([background()]);
-
-        frames.present(&first)?;
-        assert!(!frames.retains_frame(), "new content");
-        frames.present(&first)?;
-        assert!(frames.retains_frame(), "repeated content");
-        frames.present(&second)?;
-        assert!(frames.retains_frame(), "new content after repeated content");
-        frames.present(&third)?;
-        assert!(!frames.retains_frame(), "new content after new content");
-        frames.present(&third)?;
-        assert!(frames.retains_frame(), "repeated content");
-
-        frames.present(&still)?;
-        frames.present(&still)?;
-        assert!(!frames.retains_frame(), "nothing rotates");
         Ok(())
     }
 

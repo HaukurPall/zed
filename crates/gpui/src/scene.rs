@@ -6,15 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, size,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
-    num::NonZeroU64,
     ops::{Add, Range, Sub},
     slice,
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -54,14 +52,12 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     has_rotating_sprites: bool,
-    content_id: Option<NonZeroU64>,
 }
 
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
         self.has_rotating_sprites = false;
-        self.content_id = None;
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -168,29 +164,6 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
-
-        static NEXT_CONTENT_ID: AtomicU64 = AtomicU64::new(1);
-        self.content_id = NonZeroU64::new(NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed));
-    }
-
-    /// Identifies what the scene draws, apart from the angles of its rotating
-    /// sprites: frames with the same id differ only in those angles. `None`
-    /// until the scene is finished.
-    pub fn content_id(&self) -> Option<NonZeroU64> {
-        self.content_id
-    }
-
-    /// The bounds that each rotating sprite paints within, whatever its angle.
-    pub fn rotating_sprite_bounds(&self) -> impl Iterator<Item = Bounds<ScaledPixels>> + '_ {
-        let sprites: &[MonochromeSprite] = if self.has_rotating_sprites {
-            &self.monochrome_sprites
-        } else {
-            &[]
-        };
-        sprites
-            .iter()
-            .filter(|sprite| sprite.rotation_period_ms != 0)
-            .map(|sprite| sprite.rotation_bounds())
     }
 
     /// Turns each continuously rotating sprite to its angle after `elapsed`.
@@ -775,12 +748,6 @@ impl MonochromeSprite {
             .translate(center)
             .rotate(Radians(turn * std::f32::consts::TAU))
             .translate(point(ScaledPixels(-center.x.0), ScaledPixels(-center.y.0)))
-    }
-
-    fn rotation_bounds(&self) -> Bounds<ScaledPixels> {
-        let diagonal = ScaledPixels(self.bounds.size.width.0.hypot(self.bounds.size.height.0));
-        Bounds::centered_at(self.bounds.center(), size(diagonal, diagonal))
-            .intersect(&self.content_mask.bounds)
     }
 }
 
