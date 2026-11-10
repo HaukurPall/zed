@@ -7,8 +7,8 @@
 //! display frame, and a tab icon's view is the whole pane with the terminal
 //! grid: that kept a core a third busy while agents ran. So these icons use
 //! `Icon::with_rotation_period`, which GPUI applies as it presents a frame
-//! without rendering any view, and the wgpu renderer then redraws only around
-//! them. These reports are too expensive to show without both.
+//! without rendering any view. These reports are too expensive to show
+//! without it.
 
 /// Progress reported with OSC 9;4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
