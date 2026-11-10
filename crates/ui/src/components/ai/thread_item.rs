@@ -1,4 +1,4 @@
-use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
+use crate::{DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
     Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
@@ -345,7 +345,7 @@ impl RenderOnce for ThreadItem {
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::Small)
                         .color(Color::Muted)
-                        .with_rotate_animation(2),
+                        .with_rotation_period(Duration::from_secs(2)),
                 )
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {

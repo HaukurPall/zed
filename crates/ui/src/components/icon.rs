@@ -3,6 +3,7 @@ mod icon_decoration;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use decorated_icon::*;
 use gpui::{
@@ -151,6 +152,7 @@ pub struct Icon {
     group_hover_color: Option<Color>,
     size: Rems,
     transformation: Transformation,
+    rotation_period: Option<Duration>,
 }
 
 impl Icon {
@@ -161,6 +163,7 @@ impl Icon {
             group_hover_color: None,
             size: IconSize::default().rems(),
             transformation: Transformation::default(),
+            rotation_period: None,
         }
     }
 
@@ -180,6 +183,7 @@ impl Icon {
             group_hover_color: None,
             size: IconSize::default().rems(),
             transformation: Transformation::default(),
+            rotation_period: None,
         }
     }
 
@@ -190,6 +194,7 @@ impl Icon {
             group_hover_color: None,
             size: IconSize::default().rems(),
             transformation: Transformation::default(),
+            rotation_period: None,
         }
     }
 
@@ -206,6 +211,15 @@ impl Icon {
 
     pub fn size(mut self, size: IconSize) -> Self {
         self.size = size.rems();
+        self
+    }
+
+    /// Turns the icon clockwise once per `period`. Unlike
+    /// [`crate::CommonAnimationExt::with_rotate_animation`], this doesn't render the
+    /// view again on every frame, so it suits spinners that stay on screen.
+    /// Like that animation, it leaves raster icons still.
+    pub fn with_rotation_period(mut self, period: Duration) -> Self {
+        self.rotation_period = Some(period);
         self
     }
 
@@ -251,6 +265,9 @@ impl RenderOnce for Icon {
         let group_hover_color = self.group_hover_color.map(|color| color.color(cx));
 
         svg.with_transformation(self.transformation)
+            .when_some(self.rotation_period, |svg, period| {
+                svg.with_rotation_period(period)
+            })
             .size(self.size)
             .flex_none()
             .text_color(color)

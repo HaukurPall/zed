@@ -45,7 +45,7 @@ use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
 use ui::{
-    CommonAnimationExt, ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
@@ -1709,12 +1709,9 @@ impl Item for TerminalView {
                 (icon, color, None)
             }
         };
-        let icon = Icon::new(icon).color(icon_color);
-        let icon = if spinning {
-            icon.with_rotate_animation(2).into_any_element()
-        } else {
-            icon.into_any_element()
-        };
+        let icon = Icon::new(icon).color(icon_color).when(spinning, |icon| {
+            icon.with_rotation_period(Duration::from_secs(2))
+        });
 
         let self_handle = self.self_handle.clone();
         h_flex()
