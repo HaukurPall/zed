@@ -61,17 +61,16 @@ use gpui::{
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
-    AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, cursor_blinking,
-    cursor_line, display_offset, display_only_term_config, find_from_terminal_point,
-    full_content_range, history_size, last_non_empty_lines, make_content, new_term, open_pty,
-    palette_color, pty_options, pty_term_config, renderable_cells, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
-    vi_motion,
+    CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
+    SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
+    content_text, cursor_blinking, cursor_line, display_offset, display_only_term_config,
+    find_from_terminal_point, full_content_range, history_size, last_non_empty_lines, make_content,
+    new_term, open_pty, palette_color, pty_options, pty_term_config, renderable_cells, resize,
+    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
+    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -124,7 +123,7 @@ enum ViMotion {
 
 #[derive(Clone, Debug)]
 pub struct Search {
-    search: AlacrittySearch,
+    search: SearchData,
 }
 
 #[derive(Clone, Debug)]
@@ -323,17 +322,17 @@ pub struct Hyperlink {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum HyperlinkData {
-    Alacritty(AlacrittyHyperlink),
+    Backend(HyperlinkHandle),
     Owned { id: Option<Arc<str>>, uri: Arc<str> },
 }
 
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct Cell {
-    cell: AlacrittyCell,
+    cell: CellData,
 }
 
 pub struct RenderableCells<'a> {
-    cells: AlacrittyGridIterator<'a>,
+    cells: GridIter<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +544,65 @@ impl Default for Content {
             bottom_row_occupied: false,
         }
     }
+}
+
+/// Carries the hovered word over to a new content snapshot when the grid only shifted.
+fn adjusted_last_hovered_word(
+    columns: usize,
+    screen_lines: usize,
+    total_lines: usize,
+    display_offset: usize,
+    last_content: &Content,
+) -> (Option<HoveredWord>, GridLinesChange) {
+    let grid_size_changed =
+        columns != last_content.columns || screen_lines != last_content.screen_lines;
+
+    let Some(total_lines_delta) = total_lines.checked_signed_diff(last_content.total_lines) else {
+        return (None, GridLinesChange::Unchanged);
+    };
+
+    let Some(display_offset_delta) =
+        display_offset.checked_signed_diff(last_content.display_offset)
+    else {
+        return (None, GridLinesChange::Unchanged);
+    };
+
+    let grid_visible_lines_changed = total_lines_delta != display_offset_delta;
+
+    let grid_lines_change = if grid_size_changed || grid_visible_lines_changed {
+        GridLinesChange::Changed
+    } else {
+        GridLinesChange::Unchanged
+    };
+
+    let hovered_word = if let Some(last_hovered_word) = last_content.last_hovered_word.as_ref()
+        && grid_lines_change == GridLinesChange::Unchanged
+    {
+        if total_lines_delta == 0 {
+            // Viewport and content are the same, we can reuse existing match
+            Some(last_hovered_word.clone())
+        } else {
+            // Content is changed, but viewport is shifted the same, reuse
+            // the match, but need to shift the match lines by the same amount.
+            let mut adjusted_hovered_word = last_hovered_word.clone();
+            adjusted_hovered_word.word_match = Range::new(
+                Point::new(
+                    last_hovered_word.word_match.start().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.start().column,
+                ),
+                Point::new(
+                    last_hovered_word.word_match.end().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.end().column,
+                ),
+            );
+
+            Some(adjusted_hovered_word)
+        }
+    } else {
+        None
+    };
+
+    (hovered_word, grid_lines_change)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1525,8 +1583,8 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
-    term: Arc<AlacrittyTermLock>,
-    term_config: AlacrittyTermConfig,
+    term: Arc<TermLock>,
+    term_config: TermConfig,
     output_processor: Option<OutputParser>,
     output_events_tx: Option<futures::channel::mpsc::UnboundedSender<PtyEvent>>,
     output_generation: u64,
@@ -1732,7 +1790,7 @@ impl Terminal {
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
-        term: &mut AlacrittyTerm,
+        term: &mut Term,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3378,7 +3436,7 @@ fn spawn_task_subprocess(
     args: Vec<String>,
     env: HashMap<String, String>,
     working_directory: Option<PathBuf>,
-    term: Arc<AlacrittyTermLock>,
+    term: Arc<TermLock>,
     events_tx: futures::channel::mpsc::UnboundedSender<PtyEvent>,
     executor: &BackgroundExecutor,
 ) -> Result<SubprocessHandle> {
