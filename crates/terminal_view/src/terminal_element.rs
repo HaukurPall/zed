@@ -390,6 +390,34 @@ fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundReg
     merged
 }
 
+/// Memoizes `ensure_minimum_contrast` for one layout pass: the check costs several `powf`
+/// calls per cell, while a screen of output repeats only a few color pairs.
+struct MinimumContrastCache {
+    minimum_contrast: f32,
+    adjusted_foregrounds: HashMap<(Hsla, Hsla), Hsla>,
+}
+
+impl MinimumContrastCache {
+    fn new(minimum_contrast: f32) -> Self {
+        Self {
+            minimum_contrast,
+            adjusted_foregrounds: HashMap::default(),
+        }
+    }
+
+    fn ensure(&mut self, foreground: Hsla, background: Hsla) -> Hsla {
+        // The check is off; skip hashing every cell.
+        if self.minimum_contrast <= 0.0 {
+            return foreground;
+        }
+        let minimum_contrast = self.minimum_contrast;
+        *self
+            .adjusted_foregrounds
+            .entry((foreground, background))
+            .or_insert_with(|| ensure_minimum_contrast(foreground, background, minimum_contrast))
+    }
+}
+
 /// The GPUI element that paints the terminal.
 /// We need to keep a reference to the model for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
 pub struct TerminalElement {
@@ -460,6 +488,7 @@ impl TerminalElement {
         let mut batched_runs = Vec::with_capacity(estimated_runs);
         let mut block_element_regions = Vec::new();
         let mut cell_count = 0;
+        let mut contrast_cache = MinimumContrastCache::new(minimum_contrast);
 
         // Collect background regions for efficient merging
         let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
@@ -531,7 +560,7 @@ impl TerminalElement {
                             theme,
                             text_style,
                             hyperlink,
-                            minimum_contrast,
+                            &mut contrast_cache,
                         );
 
                         let cell_point = LayoutPoint::new(display_line, point.column as i32);
@@ -877,14 +906,14 @@ impl TerminalElement {
         colors: &Theme,
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &Range)>,
-        minimum_contrast: f32,
+        contrast_cache: &mut MinimumContrastCache,
     ) -> TextRun {
         let skip_contrast = Self::is_app_chosen_exact_color(&fg);
         let mut fg = convert_color(&fg, colors);
         let bg = convert_color(&bg, colors);
 
         if !skip_contrast && !Self::is_decorative_character(cell.character()) {
-            fg = ensure_minimum_contrast(fg, bg, minimum_contrast);
+            fg = contrast_cache.ensure(fg, bg);
         }
 
         // Use a dim multiplier that stays close to the existing Alacritty look.
@@ -2582,6 +2611,58 @@ mod tests {
         assert_eq!(
             good_contrast, black_fg,
             "Good contrast should not be adjusted"
+        );
+    }
+
+    #[test]
+    fn test_minimum_contrast_cache_matches_uncached() {
+        let foregrounds = [
+            Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.5,
+                a: 1.0,
+            },
+            Hsla {
+                h: 0.66,
+                s: 1.0,
+                l: 0.5,
+                a: 0.8,
+            },
+        ];
+        let backgrounds = [0.0, 0.45, 0.55, 1.0].map(|lightness| Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: lightness,
+            a: 1.0,
+        });
+        for foreground in foregrounds {
+            assert!(
+                backgrounds.iter().any(|background| ensure_minimum_contrast(
+                    foreground,
+                    *background,
+                    45.0
+                ) != foreground),
+                "each foreground needs an adjustment on some background"
+            );
+        }
+
+        let mut cache = MinimumContrastCache::new(45.0);
+        for _ in 0..2 {
+            for foreground in foregrounds {
+                for background in backgrounds {
+                    assert_eq!(
+                        cache.ensure(foreground, background),
+                        ensure_minimum_contrast(foreground, background, 45.0)
+                    );
+                }
+            }
+        }
+
+        let mut disabled = MinimumContrastCache::new(0.0);
+        assert_eq!(
+            disabled.ensure(foregrounds[0], backgrounds[1]),
+            foregrounds[0]
         );
     }
 
