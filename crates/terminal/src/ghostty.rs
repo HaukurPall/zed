@@ -107,10 +107,16 @@ pub(super) struct TermConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct CellData {
     character: char,
-    zerowidth: Option<Arc<[char]>>,
     fg: Color,
     bg: Color,
     flags: CellFlags,
+    /// Every frame copies every cell, so the rarely set fields live behind one pointer.
+    extra: Option<Arc<CellExtra>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CellExtra {
+    zerowidth: Option<Box<[char]>>,
     hyperlink: Option<Hyperlink>,
 }
 
@@ -118,11 +124,10 @@ impl Default for CellData {
     fn default() -> Self {
         Self {
             character: ' ',
-            zerowidth: None,
             fg: Color::Named(NamedColor::Foreground),
             bg: Color::Named(NamedColor::Background),
             flags: CellFlags::default(),
-            hyperlink: None,
+            extra: None,
         }
     }
 }
@@ -199,6 +204,7 @@ struct Frame {
     cells: Vec<IndexedCell>,
     display_offset: usize,
     cursor: Cursor,
+    cursor_char: char,
     cursor_blinking: bool,
     images: Vec<TerminalImage>,
 }
@@ -1721,25 +1727,31 @@ impl Renderer {
 
     fn frame(&self) -> Frame {
         let display_offset = self.display_offset;
-        let cells = self
-            .row_cells
-            .iter()
-            .enumerate()
-            .flat_map(|(row, (_, cells))| {
-                let line = row as i32 - display_offset as i32;
-                cells
+        let mut cells =
+            Vec::with_capacity(self.row_cells.iter().map(|(_, cells)| cells.len()).sum());
+        for (row, (_, row_cells)) in self.row_cells.iter().enumerate() {
+            let line = row as i32 - display_offset as i32;
+            cells.extend(
+                row_cells
                     .iter()
                     .enumerate()
-                    .map(move |(column, cell)| IndexedCell {
+                    .map(|(column, cell)| IndexedCell {
                         point: Point::new(line, column),
                         cell: Cell { cell: cell.clone() },
-                    })
-            })
-            .collect();
+                    }),
+            );
+        }
+        let cursor_char = (self.cursor.point.line + display_offset as i32)
+            .try_into()
+            .ok()
+            .and_then(|row: usize| self.row_cells.get(row))
+            .and_then(|(_, row_cells)| row_cells.get(self.cursor.point.column))
+            .map_or(' ', |cell| cell.character);
         Frame {
             cells,
             display_offset,
             cursor: self.cursor,
+            cursor_char,
             cursor_blinking: self.cursor_blinking,
             images: self.placements.clone(),
         }
@@ -1936,14 +1948,14 @@ fn read_row(
     row: &RowIteration<'static, '_>,
     viewport_row: u32,
 ) -> Vec<CellData> {
-    let mut output = Vec::new();
+    let raw_cells = row.cells_raw().expect("read cells");
+    let mut output = Vec::with_capacity(raw_cells.len());
     let mut graphemes = Vec::new();
     // Style ids are only unique within a page, and a row never spans pages.
     let mut styles: Vec<(StyleId, CellStyle)> = Vec::new();
-    let mut cell_iteration = cells.update(row).expect("iterate cells");
-    let mut column = 0;
-    while let Some(cell) = cell_iteration.next() {
-        let raw = cell.raw_cell().expect("read cell");
+    // Moved only to the few cells whose raw value isn't enough, since each move is an FFI call.
+    let mut cell = cells.update(row).expect("iterate cells");
+    for (raw, column) in raw_cells.zip(0..) {
         let (content, codepoint, wide, has_styling, style_id, has_hyperlink) = raw
             .get_multi((
                 cell_key::ContentTag,
@@ -1955,6 +1967,7 @@ fn read_row(
             ))
             .expect("read cell");
         let mut data = CellData::default();
+        let mut zerowidth = None;
         match content {
             CellContentTag::Codepoint => match codepoint {
                 0 => {}
@@ -1963,12 +1976,13 @@ fn read_row(
                 }
             },
             CellContentTag::CodepointGrapheme => {
+                cell.select(column).expect("select cell");
                 graphemes.resize(cell.graphemes_len().expect("read graphemes") as usize, ' ');
                 cell.graphemes_buf(&mut graphemes).expect("read graphemes");
                 if let Some((&first, rest)) = graphemes.split_first() {
                     data.character = first;
                     if !rest.is_empty() {
-                        data.zerowidth = Some(Arc::from(rest));
+                        zerowidth = Some(Box::from(rest));
                     }
                 }
             }
@@ -1992,6 +2006,7 @@ fn read_row(
             let style = match styles.iter().find(|(cached, _)| *cached == style_id) {
                 Some((_, style)) => *style,
                 None => {
+                    cell.select(column).expect("select cell");
                     let style = CellStyle::new(cell.style().expect("read cell style"));
                     styles.push((style_id, style));
                     style
@@ -2007,19 +2022,25 @@ fn read_row(
             data.flags.0 |= style.flags.0;
         }
 
-        if has_hyperlink {
+        let hyperlink = if has_hyperlink {
             let grid_ref = terminal
                 .grid_ref(GhosttyPoint::Viewport(PointCoordinate {
                     x: column,
                     y: viewport_row,
                 }))
                 .expect("resolve visible cell");
-            data.hyperlink =
-                hyperlink_uri(&grid_ref).map(|uri| Hyperlink::new(None::<String>, uri));
+            hyperlink_uri(&grid_ref).map(|uri| Hyperlink::new(None::<String>, uri))
+        } else {
+            None
+        };
+        if zerowidth.is_some() || hyperlink.is_some() {
+            data.extra = Some(Arc::new(CellExtra {
+                zerowidth,
+                hyperlink,
+            }));
         }
 
         output.push(data);
-        column += 1;
     }
     output
 }
@@ -2029,6 +2050,7 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
         cells,
         display_offset,
         cursor,
+        cursor_char,
         cursor_blinking,
         images,
     } = term.renderer.borrow_mut().display_frame(&term.terminal);
@@ -2039,11 +2061,6 @@ pub(super) fn make_content(term: &Term, last_content: &Content) -> Content {
     let screen_lines = screen_rows(term);
     let total_lines = total_lines(term);
     let history = history_rows(term);
-
-    let cursor_char = cells
-        .iter()
-        .find(|cell| cell.point == cursor.point)
-        .map_or(' ', |cell| cell.character());
 
     let bottom_line = screen_lines as i32 - 1 - display_offset as i32;
     let bottom_row_occupied = cursor.point.line >= bottom_line
@@ -2607,12 +2624,12 @@ impl Cell {
 
     #[inline]
     pub fn zerowidth(&self) -> Option<&[char]> {
-        self.cell.zerowidth.as_deref()
+        self.cell.extra.as_ref()?.zerowidth.as_deref()
     }
 
     #[inline]
     pub fn hyperlink(&self) -> Option<Hyperlink> {
-        self.cell.hyperlink.clone()
+        self.cell.extra.as_ref()?.hyperlink.clone()
     }
 
     #[inline]
