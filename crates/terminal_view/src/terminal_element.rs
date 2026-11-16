@@ -358,35 +358,34 @@ impl TerminalLayoutCell for &IndexedCell {
     }
 }
 
-/// Merge grid regions to minimize the number of rectangles.
-fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
-    if regions.is_empty() {
-        return regions;
-    }
+/// Merge non-overlapping grid regions into fewer rectangles.
+fn merge_background_regions(mut regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
+    regions.sort_unstable_by_key(|region| (region.start_line, region.end_line, region.start_col));
 
-    let mut merged = regions;
-    let mut changed = true;
-
-    // Keep merging until no more merges are possible
-    while changed {
-        changed = false;
-        let mut i = 0;
-
-        while i < merged.len() {
-            let mut j = i + 1;
-            while j < merged.len() {
-                if merged[i].can_merge_with(&merged[j]) {
-                    let other = merged.remove(j);
-                    merged[i].merge_with(&other);
-                    changed = true;
-                } else {
-                    j += 1;
-                }
-            }
-            i += 1;
+    let mut neighbors_merged: Vec<BackgroundRegion> = Vec::with_capacity(regions.len());
+    for region in regions {
+        match neighbors_merged.last_mut() {
+            Some(previous) if previous.can_merge_with(&region) => previous.merge_with(&region),
+            _ => neighbors_merged.push(region),
         }
     }
 
+    // Regions arrive by start line, so the latest region with a given column span and color is
+    // the lowest one, the only one the next region with that span can extend.
+    let mut merged: Vec<BackgroundRegion> = Vec::with_capacity(neighbors_merged.len());
+    let mut lowest_by_span: HashMap<(i32, i32, Hsla), usize> = HashMap::default();
+    for region in neighbors_merged {
+        let span = (region.start_col, region.end_col, region.color);
+        if let Some(&index) = lowest_by_span.get(&span)
+            && let Some(above) = merged.get_mut(index)
+            && above.can_merge_with(&region)
+        {
+            above.merge_with(&region);
+        } else {
+            lowest_by_span.insert(span, merged.len());
+            merged.push(region);
+        }
+    }
     merged
 }
 
@@ -490,7 +489,6 @@ impl TerminalElement {
         let mut cell_count = 0;
         let mut contrast_cache = MinimumContrastCache::new(minimum_contrast);
 
-        // Collect background regions for efficient merging
         let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
         let mut current_batch: Option<BatchedTextRun> = None;
 
@@ -627,22 +625,18 @@ impl TerminalElement {
             batched_runs.push(batch);
         }
 
-        // Second pass: merge background regions and convert to layout rects
-        let region_count = background_regions.len();
-        let merged_regions = merge_background_regions(background_regions);
-        let mut rects = Vec::with_capacity(merged_regions.len() * 2); // Estimate 2 rects per merged region
-
-        // Convert merged regions to layout rects
-        // Since LayoutRect only supports single-line rectangles, we need to split multi-line regions
-        for region in merged_regions {
-            for line in region.start_line..=region.end_line {
-                rects.push(LayoutRect::new(
-                    LayoutPoint::new(line, region.start_col),
+        // Each region is already a whole same-colored run of one line, and a LayoutRect can't span
+        // lines, so merging regions across lines would only split back into the same rects.
+        let rects: Vec<LayoutRect> = background_regions
+            .into_iter()
+            .map(|region| {
+                LayoutRect::new(
+                    LayoutPoint::new(region.start_line, region.start_col),
                     (region.end_col - region.start_col + 1) as usize,
                     region.color,
-                ));
-            }
-        }
+                )
+            })
+            .collect();
 
         let block_element_region_count = block_element_regions.len();
         let block_element_rects = Self::block_element_regions_to_rects(block_element_regions);
@@ -650,14 +644,13 @@ impl TerminalElement {
 
         log::debug!(
             "Terminal layout_grid: {} cells processed, \
-            {} batched runs created, {} block element rects (from {} regions), {} rects (from {} merged regions), \
+            {} batched runs created, {} block element rects (from {} regions), {} background rects, \
             layout took {:?}",
             cell_count,
             batched_runs.len(),
             block_element_rects.len(),
             block_element_region_count,
             rects.len(),
-            region_count,
             layout_time
         );
 
@@ -865,7 +858,7 @@ impl TerminalElement {
         let end_col = start_col + num_of_columns - 1;
 
         // Extend the previous region when possible (e.g. runs of `█` in a QR
-        // code) to keep the quadratic merge pass over a small input.
+        // code) to keep the merge pass's input small.
         if let Some(last_region) = regions.last_mut()
             && last_region.color == color
             && last_region.start_line == start_line
@@ -2951,6 +2944,81 @@ mod tests {
 
         let merged2 = merge_background_regions(regions2);
         assert_eq!(merged2.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_background_regions_keeps_coverage() {
+        fn coverage(regions: &[BackgroundRegion]) -> HashMap<(i32, i32), Hsla> {
+            let mut covered = HashMap::default();
+            for region in regions {
+                for line in region.start_line..=region.end_line {
+                    for column in region.start_col..=region.end_col {
+                        assert!(
+                            covered.insert((line, column), region.color).is_none(),
+                            "regions overlap at line {line}, column {column}"
+                        );
+                    }
+                }
+            }
+            covered
+        }
+
+        let characters = [
+            '█',
+            '▀',
+            '▄',
+            '▌',
+            '▐',
+            '▚',
+            '▞',
+            '▒',
+            '▁',
+            '▇',
+            '▏',
+            '▕',
+            '\u{1FB00}',
+            '🬉',
+            '🬆',
+            '🬹',
+            'a',
+        ];
+        let colors = [Hsla::red(), Hsla::blue(), Hsla::green()];
+        // xorshift32, for repeatable grids without a dependency.
+        let mut state: u32 = 0x9E37_79B9;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound
+        };
+        let mut merged_any = false;
+        for _ in 0..20 {
+            let mut regions = Vec::new();
+            for line in 0..6 {
+                for column in 0..8 {
+                    TerminalElement::collect_block_element_regions(
+                        LayoutPoint::new(line, column),
+                        characters[next(characters.len())],
+                        colors[next(colors.len())],
+                        &mut regions,
+                    );
+                }
+            }
+
+            let merged = merge_background_regions(regions.clone());
+
+            assert_eq!(coverage(&merged), coverage(&regions));
+            for (index, region) in merged.iter().enumerate() {
+                for other in &merged[index + 1..] {
+                    assert!(
+                        !region.can_merge_with(other),
+                        "left mergeable regions {region:?} and {other:?}"
+                    );
+                }
+            }
+            merged_any |= merged.len() < regions.len();
+        }
+        assert!(merged_any, "no grid exercised a merge");
     }
 
     #[test]
