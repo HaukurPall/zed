@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [features]
 # Use libghostty-vt instead of alacritty_terminal for terminal emulation (Linux and macOS).
-ghostty = ["dep:image", "dep:libghostty-vt", "dep:polling"]
+ghostty = ["dep:image", "dep:libghostty-vt", "dep:polling", "dep:serde_json"]
 test-support = [
     "collections/test-support",
     "gpui/test-support",
@@ -38,6 +38,7 @@ regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 settings.workspace = true
 sysinfo.workspace = true
 task.workspace = true

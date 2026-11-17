@@ -18031,6 +18031,7 @@ dependencies = [
  "release_channel",
  "schemars 1.0.4",
  "serde",
+ "serde_json",
  "settings",
  "sysinfo 0.39.6",
  "task",
