@@ -1681,9 +1681,13 @@ impl Element for TerminalElement {
                         }
                     };
                     paint_images(TerminalImageLayer::BelowBackground, window);
-                    for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
-                    }
+                    // One layer orders all of the grid's rects at once; ordering each rect on
+                    // its own costs more than drawing it when every cell has its own color.
+                    window.paint_layer(|window| {
+                        for rect in &layout.rects {
+                            rect.paint(origin, &layout.dimensions, window);
+                        }
+                    });
                     paint_images(TerminalImageLayer::BelowText, window);
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
@@ -1712,9 +1716,11 @@ impl Element for TerminalElement {
                     for batch in &layout.batched_text_runs {
                         batch.paint(origin, &layout.dimensions, window, cx);
                     }
-                    for block_element_rect in &layout.block_element_rects {
-                        block_element_rect.paint(origin, &layout.dimensions, window);
-                    }
+                    window.paint_layer(|window| {
+                        for block_element_rect in &layout.block_element_rects {
+                            block_element_rect.paint(origin, &layout.dimensions, window);
+                        }
+                    });
                     paint_images(TerminalImageLayer::AboveText, window);
                     free_unpainted_images(&terminal_view, &layout.images, window, cx);
                     let text_paint_time = text_paint_start.elapsed();
