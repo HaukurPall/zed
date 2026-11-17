@@ -43,10 +43,10 @@ use libghostty_vt::{
         CellIterator, CursorVisualStyle, Dirty, ImageIterator, ImageLayer, ImageProtocol,
         RenderState, RowId, RowIteration, RowIterator, Snapshot,
     },
-    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef, cell as cell_key},
+    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     search::{MatchBuffer, Search as GhosttySearch},
     selection::Selection as GhosttySelection,
-    style::{Id as StyleId, Palette, RgbColor, Style, StyleColor, Underline},
+    style::{Palette, RgbColor, Style, StyleColor, Underline},
     terminal::{
         ClipboardWriteError, ColorScheme, CompressionActivity, CompressionMode, CompressionResult,
         ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
@@ -178,6 +178,7 @@ struct Renderer {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    cell_layout: CellLayout,
     /// Each viewport row's cells, kept until libghostty marks the row dirty.
     row_cells: Vec<(RowId, Vec<CellData>)>,
     /// The scroll position and cursor that go with `row_cells`.
@@ -1624,6 +1625,7 @@ impl Renderer {
             state: RenderState::new().expect("create render state"),
             rows: RowIterator::new().expect("create row iterator"),
             cells: CellIterator::new().expect("create cell iterator"),
+            cell_layout: CellLayout::from_manifest().expect("read libghostty's cell layout"),
             row_cells: Vec::new(),
             display_offset: 0,
             cursor: Cursor {
@@ -1663,6 +1665,7 @@ impl Renderer {
             state,
             rows,
             cells,
+            cell_layout,
             row_cells,
             ..
         } = self;
@@ -1680,7 +1683,10 @@ impl Renderer {
                         .get(viewport_row)
                         .is_some_and(|(cached_id, _)| *cached_id == id);
                 if !cached {
-                    let row_data = (id, read_row(terminal, cells, row, viewport_row as u32));
+                    let row_data = (
+                        id,
+                        read_row(terminal, cells, cell_layout, row, viewport_row as u32),
+                    );
                     match row_cells.get_mut(viewport_row) {
                         Some(slot) => *slot = row_data,
                         None => row_cells.push(row_data),
@@ -1941,10 +1947,222 @@ impl CellStyle {
     }
 }
 
+/// One field of a packed cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BitField {
+    shift: u32,
+    mask: u64,
+}
+
+impl BitField {
+    fn from_manifest(field: &serde_json::Value, base: u64) -> Result<Self> {
+        let lsb = field["lsb"].as_u64().context("field without lsb")?;
+        let width = field["width"].as_u64().context("field without width")?;
+        anyhow::ensure!(
+            (1..64).contains(&width) && base + lsb + width <= 64,
+            "field outside 64 bits: {field}"
+        );
+        Ok(Self {
+            shift: (base + lsb) as u32,
+            mask: (1 << width) - 1,
+        })
+    }
+
+    fn read(self, packed: u64) -> u64 {
+        (packed >> self.shift) & self.mask
+    }
+}
+
+/// Where libghostty keeps each field of a packed cell, read from its type manifest.
+///
+/// Decoding the packed value directly replaces several FFI calls per cell.
+/// Bit positions aren't part of libghostty's ABI, so they come from the
+/// manifest of the linked build rather than being hardcoded.
+struct CellLayout {
+    content_tag: BitField,
+    content_tags: [CellContentTag; 4],
+    codepoint: BitField,
+    palette_index: BitField,
+    red: BitField,
+    green: BitField,
+    blue: BitField,
+    style_id: BitField,
+    wide: BitField,
+    wides: [CellWide; 4],
+    hyperlink: BitField,
+}
+
+/// The fields of a packed cell that the cell itself holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecodedCell {
+    content: CellContentTag,
+    codepoint: u32,
+    wide: CellWide,
+    /// Unique only within a page; 0 is the default style.
+    style_id: u16,
+    has_hyperlink: bool,
+}
+
+impl CellLayout {
+    fn from_manifest() -> Result<Self> {
+        // SAFETY: libghostty returns a NUL-terminated string that lives as long as the process.
+        let json = unsafe { std::ffi::CStr::from_ptr(libghostty_vt::ffi::ghostty_type_json()) }
+            .to_str()?;
+        let manifest: serde_json::Value = serde_json::from_str(json)?;
+        anyhow::ensure!(
+            manifest["schema"] == 1,
+            "unknown manifest schema {}",
+            manifest["schema"]
+        );
+        let types = &manifest["types"];
+        let cell = &types["GhosttyCell"];
+        anyhow::ensure!(
+            cell["kind"] == "packed" && cell["underlying"] == "u64",
+            "cells are no longer packed into a u64"
+        );
+        let bits = &cell["bits"];
+        let content = &bits["content"];
+        let content_lsb = content["lsb"].as_u64().context("content without lsb")?;
+        let arms = &content["arms"];
+        let codepoint =
+            BitField::from_manifest(&arms["CODEPOINT"]["bits"]["codepoint"], content_lsb)?;
+        anyhow::ensure!(
+            codepoint
+                == BitField::from_manifest(
+                    &arms["CODEPOINT_GRAPHEME"]["bits"]["codepoint"],
+                    content_lsb
+                )?,
+            "grapheme cells keep their first codepoint elsewhere"
+        );
+        let rgb = &arms["BG_COLOR_RGB"]["bits"];
+
+        let content_tag = BitField::from_manifest(&bits["content_tag"], 0)?;
+        let content_tags = enum_table(
+            &types["GhosttyCellContentTag"]["values"],
+            content_tag,
+            [
+                ("CODEPOINT", CellContentTag::Codepoint),
+                ("CODEPOINT_GRAPHEME", CellContentTag::CodepointGrapheme),
+                ("BG_COLOR_PALETTE", CellContentTag::BgColorPalette),
+                ("BG_COLOR_RGB", CellContentTag::BgColorRgb),
+            ],
+        )?;
+        let wide = BitField::from_manifest(&bits["wide"], 0)?;
+        let wides = enum_table(
+            &types["GhosttyCellWide"]["values"],
+            wide,
+            [
+                ("NARROW", CellWide::Narrow),
+                ("WIDE", CellWide::Wide),
+                ("SPACER_TAIL", CellWide::SpacerTail),
+                ("SPACER_HEAD", CellWide::SpacerHead),
+            ],
+        )?;
+        let style_id = BitField::from_manifest(&bits["style_id"], 0)?;
+        anyhow::ensure!(
+            style_id.mask <= u16::MAX as u64,
+            "style ids no longer fit a u16"
+        );
+        let hyperlink = BitField::from_manifest(&bits["hyperlink"], 0)?;
+        anyhow::ensure!(
+            hyperlink.mask == 1,
+            "the hyperlink flag is no longer one bit"
+        );
+        anyhow::ensure!(
+            codepoint.mask <= u32::MAX as u64,
+            "codepoints no longer fit a u32"
+        );
+        let palette_index =
+            BitField::from_manifest(&arms["BG_COLOR_PALETTE"]["bits"]["index"], content_lsb)?;
+        let red = BitField::from_manifest(&rgb["r"], content_lsb)?;
+        let green = BitField::from_manifest(&rgb["g"], content_lsb)?;
+        let blue = BitField::from_manifest(&rgb["b"], content_lsb)?;
+        anyhow::ensure!(
+            [palette_index, red, green, blue]
+                .iter()
+                .all(|field| field.mask <= u8::MAX as u64),
+            "background colors no longer fit a byte"
+        );
+        Ok(Self {
+            content_tag,
+            content_tags,
+            codepoint,
+            palette_index,
+            red,
+            green,
+            blue,
+            style_id,
+            wide,
+            wides,
+            hyperlink,
+        })
+    }
+
+    fn decode(&self, packed: u64) -> DecodedCell {
+        let content = self.content_tags[self.content_tag.read(packed) as usize];
+        let codepoint = match content {
+            CellContentTag::Codepoint | CellContentTag::CodepointGrapheme => {
+                self.codepoint.read(packed) as u32
+            }
+            CellContentTag::BgColorPalette | CellContentTag::BgColorRgb => 0,
+        };
+        DecodedCell {
+            content,
+            codepoint,
+            wide: self.wides[self.wide.read(packed) as usize],
+            style_id: self.style_id.read(packed) as u16,
+            has_hyperlink: self.hyperlink.read(packed) != 0,
+        }
+    }
+
+    fn palette_index(&self, packed: u64) -> u8 {
+        self.palette_index.read(packed) as u8
+    }
+
+    fn rgb(&self, packed: u64) -> Rgb {
+        Rgb {
+            r: self.red.read(packed) as u8,
+            g: self.green.read(packed) as u8,
+            b: self.blue.read(packed) as u8,
+        }
+    }
+}
+
+/// Maps every value a two-bit enum field can hold to its Rust variant.
+fn enum_table<T: Copy>(
+    values: &serde_json::Value,
+    field: BitField,
+    variants: [(&str, T); 4],
+) -> Result<[T; 4]> {
+    anyhow::ensure!(field.mask == 3, "enum field is no longer two bits wide");
+    let mut table: [Option<T>; 4] = [None; 4];
+    for (name, variant) in variants {
+        let value = values[name]
+            .as_u64()
+            .with_context(|| format!("no enum value {name}"))?;
+        let slot = table
+            .get_mut(value as usize)
+            .with_context(|| format!("enum value {name} = {value} out of range"))?;
+        anyhow::ensure!(slot.is_none(), "two enum names share value {value}");
+        *slot = Some(variant);
+    }
+    let [first, second, third, fourth] =
+        table.map(|variant| variant.context("enum value without a variant"));
+    Ok([first?, second?, third?, fourth?])
+}
+
+/// The packed value of a cell, which libghostty-rs keeps private.
+fn packed_cell(cell: libghostty_vt::screen::Cell) -> u64 {
+    // SAFETY: `Cell` wraps libghostty's packed `u64` by value, and `transmute`
+    // fails to compile unless both have the same size.
+    unsafe { std::mem::transmute::<libghostty_vt::screen::Cell, u64>(cell) }
+}
+
 /// Copies one row out of libghostty's render state.
 fn read_row(
     terminal: &GhosttyTerminal<'static, 'static>,
     cells: &mut CellIterator<'static>,
+    layout: &CellLayout,
     row: &RowIteration<'static, '_>,
     viewport_row: u32,
 ) -> Vec<CellData> {
@@ -1952,20 +2170,19 @@ fn read_row(
     let mut output = Vec::with_capacity(raw_cells.len());
     let mut graphemes = Vec::new();
     // Style ids are only unique within a page, and a row never spans pages.
-    let mut styles: Vec<(StyleId, CellStyle)> = Vec::new();
+    let mut styles: Vec<(u16, CellStyle)> = Vec::new();
     // Moved only to the few cells whose raw value isn't enough, since each move is an FFI call.
     let mut cell = cells.update(row).expect("iterate cells");
     for (raw, column) in raw_cells.zip(0..) {
-        let (content, codepoint, wide, has_styling, style_id, has_hyperlink) = raw
-            .get_multi((
-                cell_key::ContentTag,
-                cell_key::Codepoint,
-                cell_key::Wide,
-                cell_key::HasStyling,
-                cell_key::StyleId,
-                cell_key::HasHyperlink,
-            ))
-            .expect("read cell");
+        let packed = packed_cell(raw);
+        let DecodedCell {
+            content,
+            codepoint,
+            wide,
+            style_id,
+            has_hyperlink,
+        } = layout.decode(packed);
+        let has_styling = style_id != 0;
         let mut data = CellData::default();
         let mut zerowidth = None;
         match content {
@@ -1987,15 +2204,10 @@ fn read_row(
                 }
             }
             CellContentTag::BgColorPalette => {
-                data.bg = indexed_color(raw.bg_color_palette().expect("read cell background").0);
+                data.bg = indexed_color(layout.palette_index(packed));
             }
             CellContentTag::BgColorRgb => {
-                let rgb = raw.bg_color_rgb().expect("read cell background");
-                data.bg = Color::Spec(Rgb {
-                    r: rgb.r,
-                    g: rgb.g,
-                    b: rgb.b,
-                });
+                data.bg = Color::Spec(layout.rgb(packed));
             }
         }
         data.flags
@@ -2735,6 +2947,100 @@ mod tests {
         let mut selection = Selection::new(ty, start, SelectionSide::Left);
         selection.update(end, SelectionSide::Right);
         set_selection(term, Some(&selection));
+    }
+
+    #[test]
+    fn cell_layout_decodes_like_libghostty() {
+        use libghostty_vt::screen::cell as cell_key;
+
+        const COLUMNS: u16 = 40;
+        let mut terminal = GhosttyTerminal::new(COLUMNS, 8).unwrap();
+        terminal.vt_write(
+            format!(
+                "plain \x1b[1;31mbold red\x1b[0m \x1b[38;5;123;4mpalette\x1b[0m \
+                 \x1b[38;2;1;2;3;3mrgb\x1b[0m\
+                 \x1b[2;1H\x1b[44m\x1b[K\x1b[0m\
+                 \x1b[3;1H\x1b[48;5;200m\x1b[K\x1b[0m\
+                 \x1b[4;1H\x1b[48;2;10;200;30m\x1b[K\x1b[0m\
+                 \x1b[5;1He\u{301} a\u{308}\u{323} \u{1f469}\u{200d}\u{1f4bb} 中文 \
+                 \x1b]8;;https://example.com/x\x1b\\link\x1b]8;;\x1b\\\
+                 \x1b[6;{COLUMNS}H中"
+            )
+            .as_bytes(),
+        );
+        let layout = CellLayout::from_manifest().unwrap();
+        let mut state = RenderState::new().unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+        let mut rows = RowIterator::new().unwrap();
+        let mut iteration = rows.update(&snapshot).unwrap();
+        let mut contents = Vec::new();
+        let mut wides = Vec::new();
+        let mut style_pairs = Vec::new();
+        let mut styled = 0;
+        let mut linked = 0;
+        while let Some(row) = iteration.next() {
+            for raw in row.cells_raw().unwrap() {
+                let (content, codepoint, wide, has_styling, style_id, has_hyperlink) = raw
+                    .get_multi((
+                        cell_key::ContentTag,
+                        cell_key::Codepoint,
+                        cell_key::Wide,
+                        cell_key::HasStyling,
+                        cell_key::StyleId,
+                        cell_key::HasHyperlink,
+                    ))
+                    .unwrap();
+                let packed = packed_cell(raw);
+                let decoded = layout.decode(packed);
+                assert_eq!(
+                    decoded,
+                    DecodedCell {
+                        content,
+                        codepoint,
+                        wide,
+                        style_id: decoded.style_id,
+                        has_hyperlink,
+                    },
+                    "{packed:#018x}"
+                );
+                assert_eq!(decoded.style_id != 0, has_styling, "{packed:#018x}");
+                // libghostty-rs's style ids are opaque, so check that both group cells alike.
+                match style_pairs
+                    .iter()
+                    .find(|(decoded_id, id)| *decoded_id == decoded.style_id || *id == style_id)
+                {
+                    Some(pair) => assert_eq!(*pair, (decoded.style_id, style_id), "{packed:#018x}"),
+                    None => style_pairs.push((decoded.style_id, style_id)),
+                }
+                match content {
+                    CellContentTag::BgColorPalette => assert_eq!(
+                        layout.palette_index(packed),
+                        raw.bg_color_palette().unwrap().0
+                    ),
+                    CellContentTag::BgColorRgb => {
+                        let expected = raw.bg_color_rgb().unwrap();
+                        let decoded = layout.rgb(packed);
+                        assert_eq!(
+                            (decoded.r, decoded.g, decoded.b),
+                            (expected.r, expected.g, expected.b)
+                        );
+                    }
+                    CellContentTag::Codepoint | CellContentTag::CodepointGrapheme => {}
+                }
+                if !contents.contains(&content) {
+                    contents.push(content);
+                }
+                if !wides.contains(&wide) {
+                    wides.push(wide);
+                }
+                styled += has_styling as usize;
+                linked += has_hyperlink as usize;
+            }
+        }
+        assert_eq!(contents.len(), 4, "content tags seen: {contents:?}");
+        assert_eq!(wides.len(), 4, "widths seen: {wides:?}");
+        assert!(style_pairs.len() > 2, "styles seen: {style_pairs:?}");
+        assert!(styled > 0 && linked > 0);
     }
 
     #[test]
