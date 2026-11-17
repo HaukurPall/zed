@@ -1,0 +1,34 @@
+# Upstream CI doesn't build the ghostty terminal backend, so this fork runs its tests here.
+name: ghostty_tests
+on:
+  push:
+    branches:
+    - ghostty-stable
+    - ghostty-stable-haukurpj
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Keeps the debug build within the hosted runner's disk.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+jobs:
+  terminal_tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+    - name: Install Linux dependencies
+      run: ./script/linux
+    # libghostty-vt-sys builds libghostty from source with Zig.
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      with:
+        version: 0.17.1
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Test the terminal crate with the ghostty backend
+      run: cargo test --locked -p terminal --features ghostty
