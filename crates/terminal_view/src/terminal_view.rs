@@ -610,9 +610,7 @@ impl TerminalView {
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
         let has_command_output = self
             .terminal
-            .read(cx)
-            .command_output_at_position(position)
-            .is_some();
+            .update(cx, |terminal, _| terminal.anchor_command_output(position));
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -636,13 +634,8 @@ impl TerminalView {
                     let terminal = self.terminal.clone();
                     menu.entry("Select Command Output", None, move |_, cx| {
                         terminal.update(cx, |terminal, cx| {
-                            // Looked up again: output may have arrived while the
-                            // menu was open, and a scrolled-back view keeps
-                            // showing the same lines under the click.
-                            if let Some(output) = terminal.command_output_at_position(position) {
-                                terminal.select_range(output);
-                                cx.notify();
-                            }
+                            terminal.select_anchored_command_output();
+                            cx.notify();
                         });
                     })
                 })

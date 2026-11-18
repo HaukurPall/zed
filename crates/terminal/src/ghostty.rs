@@ -221,6 +221,8 @@ pub(super) struct Term {
     /// Shared with the callback that answers color scheme queries.
     color_scheme: Rc<StdCell<Option<ColorScheme>>>,
     selection: Option<TermSelection>,
+    /// A cell of the command output the context menu offered to select.
+    command_output_anchor: Option<CommandOutputAnchor>,
     vi_mode: bool,
     cursor_blinking: StdCell<bool>,
     events: EventSink,
@@ -234,6 +236,13 @@ struct TermSelection {
     /// Follows the start's cell as output scrolls it.
     start: TrackedGridRef,
     /// The screen `start` belongs to.
+    screen: Screen,
+}
+
+struct CommandOutputAnchor {
+    /// Follows the cell as output scrolls it.
+    cell: TrackedGridRef,
+    /// The screen `cell` belongs to.
     screen: Screen,
 }
 
@@ -632,8 +641,9 @@ pub(super) fn new_term(
             Ok(SemanticPromptKind::OutputStart) => {
                 let command = event
                     .command()
-                    .split(|&byte| byte == b'\n')
+                    .split(u8::is_ascii_whitespace)
                     .map(display_text)
+                    .filter(|word| !word.is_empty())
                     .collect::<Vec<_>>()
                     .join(" ");
                 sink.send(TerminalBackendEvent::CommandStart(command));
@@ -686,6 +696,7 @@ pub(super) fn new_term(
         theme: None,
         color_scheme,
         selection: None,
+        command_output_anchor: None,
         vi_mode: false,
         cursor_blinking: StdCell::new(false),
         events,
@@ -1188,19 +1199,57 @@ pub(super) fn scroll_to_prompt(term: &mut Term, count: isize) {
 // --- Command output ---
 
 /// The output of the command at `point`, as the shell's prompt marks bound it.
-pub(super) fn command_output_at(term: &Term, point: Point) -> Option<Range> {
+fn command_output_at(term: &Term, point: Point) -> Option<Range> {
     let grid_ref = term
         .terminal
         .grid_ref(screen_point(term, point))
         .expect("resolve command output point");
+    command_output_of(term, grid_ref)
+}
+
+fn command_output_of(term: &Term, grid_ref: GridRef<'_>) -> Option<Range> {
     let output = term
         .terminal
         .select_output(grid_ref)
         .expect("select command output")?;
-    Some(Range::new(
-        grid_ref_point(term, &output.start())?,
-        grid_ref_point(term, &output.end())?,
-    ))
+    let start = grid_ref_point(term, &output.start())?;
+    // With no prompt above the cell, libghostty selects from the oldest row:
+    // a login banner, or output whose prompt has left the scrollback.
+    if start == Point::new(-(history_rows(term) as i32), 0) {
+        return None;
+    }
+    Some(Range::new(start, grid_ref_point(term, &output.end())?))
+}
+
+/// Remembers the command output at `point`, for selecting it after more output
+/// has scrolled it. Returns whether there is any.
+pub(super) fn anchor_command_output(term: &mut Term, point: Point) -> bool {
+    term.command_output_anchor = None;
+    if command_output_at(term, point).is_none() {
+        return false;
+    }
+    term.command_output_anchor = Some(CommandOutputAnchor {
+        cell: term
+            .terminal
+            .track_grid_ref(screen_point(term, point))
+            .expect("track command output"),
+        screen: term.terminal.active_screen().expect("read active screen"),
+    });
+    true
+}
+
+/// The command output `anchor_command_output` remembered, where it is now.
+pub(super) fn anchored_command_output(term: &mut Term) -> Option<Range> {
+    let anchor = term.command_output_anchor.take()?;
+    if anchor.screen != term.terminal.active_screen().expect("read active screen") {
+        return None;
+    }
+    // `None` once the cell's row has left the scrollback.
+    let grid_ref = anchor
+        .cell
+        .snapshot(&term.terminal)
+        .expect("resolve command output anchor")?;
+    command_output_of(term, grid_ref)
 }
 
 /// The output of the newest command above the cursor's prompt that printed any,
@@ -3508,6 +3557,8 @@ mod tests {
         term.terminal
             .vt_write(b"\x1b]133;C;cmdline_url=cargo%20test%0A--all\x07");
         term.terminal.vt_write(b"\x1b]133;D;101\x07\x1b]133;D\x07");
+        term.terminal
+            .vt_write(b"\x1b]133;C;cmdline_url=a%09b%20%20c\x07\x1b]133;C;cmdline_url=%0A%20\x07");
         assert_eq!(
             backend_events(&mut events),
             [
@@ -3515,6 +3566,8 @@ mod tests {
                 "CommandStart(\"cargo test --all\")",
                 "CommandEnd(Some(101))",
                 "CommandEnd(None)",
+                "CommandStart(\"a b c\")",
+                "CommandStart(\"\")",
             ]
         );
     }
@@ -3569,12 +3622,34 @@ mod tests {
     }
 
     #[test]
-    fn last_command_output_ignores_text_above_the_first_prompt() {
+    fn finds_no_command_output_above_the_first_prompt() {
         let (term, _events) = test_term(SettingsCursorShape::Block);
         let mut term = term.lock();
         term.terminal
             .vt_write(b"Welcome\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
         assert_eq!(last_command_output(&term), None);
+        assert_eq!(command_output_at(&term, Point::new(0, 0)), None);
+        assert!(!anchor_command_output(&mut term, Point::new(0, 0)));
+    }
+
+    #[test]
+    fn anchored_command_output_follows_scrolled_output() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        write_ls_command(&mut term);
+        // "a" and "b" are lines 0 and 1.
+        assert!(anchor_command_output(&mut term, Point::new(1, 0)));
+        write_true_command(&mut term);
+        // "a" and "b" are lines -1 and 0.
+        assert_eq!(
+            anchored_command_output(&mut term),
+            Some(Range::new(Point::new(-1, 0), Point::new(0, 0)))
+        );
+        // The anchor is used once.
+        assert_eq!(anchored_command_output(&mut term), None);
+
+        assert!(!anchor_command_output(&mut term, Point::new(1, 0)));
+        assert_eq!(anchored_command_output(&mut term), None);
     }
 
     #[test]

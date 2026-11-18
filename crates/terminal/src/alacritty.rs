@@ -297,7 +297,11 @@ pub(super) fn scroll_display(term: &mut Term, scroll: Scroll) {
 
 pub(super) fn scroll_to_prompt(_term: &mut Term, _count: isize) {}
 
-pub(super) fn command_output_at(_term: &Term, _point: Point) -> Option<Range> {
+pub(super) fn anchor_command_output(_term: &mut Term, _point: Point) -> bool {
+    false
+}
+
+pub(super) fn anchored_command_output(_term: &mut Term) -> Option<Range> {
     None
 }
 

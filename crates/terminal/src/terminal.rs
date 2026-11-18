@@ -78,14 +78,14 @@ use gpui::{
 use crate::backend::current_child_signal_mask;
 use crate::backend::{
     CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
-    SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
-    command_output_at, content_text, cursor_blinking, cursor_line, display_offset,
-    display_only_term_config, encode_key, find_from_terminal_point, full_content_range,
-    history_size, last_command_output, last_non_empty_lines, make_content, new_term, open_pty,
-    palette_color, pty_options, pty_term_config, renderable_cells, resize, screen_lines,
-    scroll_display, scroll_to_point, scroll_to_prompt, search_matches, selection_text,
-    set_default_cursor_style, set_selection as set_term_selection, set_theme, shrink_to_used,
-    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    SearchData, Term, TermConfig, TermLock, anchor_command_output, anchored_command_output,
+    append_text_to_term, apply_config, clear_saved_screen, content_text, cursor_blinking,
+    cursor_line, display_offset, display_only_term_config, encode_key, find_from_terminal_point,
+    full_content_range, history_size, last_command_output, last_non_empty_lines, make_content,
+    new_term, open_pty, palette_color, pty_options, pty_term_config, renderable_cells, resize,
+    screen_lines, scroll_display, scroll_to_point, scroll_to_prompt, search_matches,
+    selection_text, set_default_cursor_style, set_selection as set_term_selection, set_theme,
+    shrink_to_used, spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
@@ -2469,19 +2469,30 @@ impl Terminal {
         self.events.push_back(InternalEvent::Copy(keep_selection));
     }
 
-    /// The output of the command at a window position, as the shell's prompt marks bound it.
-    pub fn command_output_at_position(&self, position: GpuiPoint<Pixels>) -> Option<Range> {
+    /// Remembers the output of the command at a window position, as the shell's
+    /// prompt marks bound it, for `select_anchored_command_output`. Returns
+    /// whether there is any.
+    pub fn anchor_command_output(&mut self, position: GpuiPoint<Pixels>) -> bool {
         if !self.has_prompt_marks {
-            return None;
+            return false;
         }
-        let term = self.term.lock();
+        let mut term = self.term.lock();
         let position = position - self.last_content.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
             self.last_content.terminal_bounds,
             display_offset(&term),
         );
-        command_output_at(&term, point)
+        anchor_command_output(&mut term, point)
+    }
+
+    /// Selects the command output `anchor_command_output` remembered, wherever
+    /// output has scrolled it since.
+    pub fn select_anchored_command_output(&mut self) {
+        let Some(output) = anchored_command_output(&mut self.term.lock()) else {
+            return;
+        };
+        self.select_range(output);
     }
 
     pub fn select_range(&mut self, range: Range) {
