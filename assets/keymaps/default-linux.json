@@ -1372,6 +1372,13 @@
     },
   },
   {
+    "context": "Terminal && prompt_marks && screen == normal",
+    "bindings": {
+      "ctrl-shift-up": "terminal::ScrollToPreviousPrompt",
+      "ctrl-shift-down": "terminal::ScrollToNextPrompt",
+    },
+  },
+  {
     "context": "ZedPredictModal",
     "bindings": {
       "escape": "menu::Cancel",

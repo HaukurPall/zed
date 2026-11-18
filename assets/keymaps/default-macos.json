@@ -1439,6 +1439,14 @@
     },
   },
   {
+    "context": "Terminal && prompt_marks && screen == normal",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-shift-up": "terminal::ScrollToPreviousPrompt",
+      "cmd-shift-down": "terminal::ScrollToNextPrompt",
+    },
+  },
+  {
     "context": "RatePredictionsModal",
     "use_key_equivalents": true,
     "bindings": {

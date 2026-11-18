@@ -984,6 +984,7 @@ fn terminal_thread_status(status: Option<TerminalStatus>) -> AgentThreadStatus {
             ProgramState::Error => AgentThreadStatus::Error,
             ProgramState::Done | ProgramState::Idle => AgentThreadStatus::Completed,
         },
+        Some(TerminalStatus::CommandFailed(_)) => AgentThreadStatus::Error,
         Some(TerminalStatus::Progress(progress)) => match progress.state {
             ProgressState::Normal | ProgressState::Indeterminate => AgentThreadStatus::Running,
             ProgressState::Error => AgentThreadStatus::Error,

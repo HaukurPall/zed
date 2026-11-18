@@ -293,6 +293,22 @@ pub(super) fn scroll_display(term: &mut Term, scroll: Scroll) {
     term.scroll_display(scroll.to_alacritty());
 }
 
+// alacritty doesn't parse the shell's prompt marks (OSC 133).
+
+pub(super) fn scroll_to_prompt(_term: &mut Term, _count: isize) {}
+
+pub(super) fn anchor_command_output(_term: &mut Term, _point: Point) -> bool {
+    false
+}
+
+pub(super) fn anchored_command_output(_term: &mut Term) -> Option<Range> {
+    None
+}
+
+pub(super) fn last_command_output(_term: &Term) -> Option<Range> {
+    None
+}
+
 pub(super) fn set_selection(term: &mut Term, selection: Option<&Selection>) {
     term.selection = selection.map(Selection::to_alacritty);
 }
