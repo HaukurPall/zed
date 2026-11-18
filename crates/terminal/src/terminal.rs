@@ -862,8 +862,39 @@ pub(crate) enum TerminalBackendEvent {
     ProgramStatusClear(String),
     #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
     PromptStart,
+    /// The shell's working directory (OSC 7), or `None` when the shell withdraws its report.
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    WorkingDirectory(Option<WorkingDirectoryReport>),
     Exit,
     ChildExit(ExitStatus),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkingDirectoryReport {
+    pub host: String,
+    pub path: PathBuf,
+}
+
+/// The shell's last report of its working directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReportedWorkingDirectory {
+    /// `None` for a directory on another host, for example after `ssh`.
+    path: Option<PathBuf>,
+    /// The foreground process when the report arrived, taken as its sender.
+    sender: Option<sysinfo::Pid>,
+}
+
+impl ReportedWorkingDirectory {
+    /// Only the shell the terminal started is trusted with its directory: a
+    /// nested shell or program may not report, and one that does may exit and
+    /// leave behind one that doesn't. A program started right after a report
+    /// takes the foreground before the report is read, so attributing it to
+    /// any other process is unreliable. A report from another host, which
+    /// arrives long after `ssh` started, holds while its sender is in the
+    /// foreground.
+    fn holds(&self, foreground: Option<sysinfo::Pid>, shell: Option<sysinfo::Pid>) -> bool {
+        self.sender == foreground && (self.path.is_none() || foreground == shell)
+    }
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -887,6 +918,7 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::ProgramStatus(report) => write!(f, "ProgramStatus({report:?})"),
             Self::ProgramStatusClear(id) => write!(f, "ProgramStatusClear({id:?})"),
             Self::PromptStart => f.write_str("PromptStart"),
+            Self::WorkingDirectory(report) => write!(f, "WorkingDirectory({report:?})"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
         }
@@ -1215,6 +1247,8 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            reported_working_directory: None,
+            host_name: sysinfo::System::host_name(),
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(test)]
@@ -1521,6 +1555,8 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                reported_working_directory: None,
+                host_name: sysinfo::System::host_name(),
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(test)]
@@ -1713,6 +1749,10 @@ pub struct Terminal {
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
     pending_cwd_boundary: Option<i32>,
+    reported_working_directory: Option<ReportedWorkingDirectory>,
+    /// This machine's name when the terminal started. A shell keeps reporting
+    /// the name it started with after the machine's name changes.
+    host_name: Option<String>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
     #[cfg(test)]
@@ -1867,6 +1907,7 @@ impl Terminal {
                 cx.emit(Event::StatusChanged);
             }
             TerminalBackendEvent::PromptStart => self.clear_running_status(cx),
+            TerminalBackendEvent::WorkingDirectory(report) => self.report_working_directory(report),
             TerminalBackendEvent::Exit => {
                 self.clear_running_status(cx);
                 self.register_task_finished(None, cx);
@@ -2263,6 +2304,7 @@ impl Terminal {
         self.mouse_down_hyperlink = None;
         self.cwd_history.clear();
         self.pending_cwd_boundary = None;
+        self.reported_working_directory = None;
         self.write_raw_output(bytes, cx);
         cx.emit(Event::BlinkChanged(cursor_blinking(&self.term.lock())));
         cx.emit(Event::BreadcrumbsChanged);
@@ -3185,15 +3227,28 @@ impl Terminal {
         })
     }
 
+    /// The directory the shell reported, while it holds, else the foreground
+    /// process's directory.
     pub fn working_directory(&self) -> Option<PathBuf> {
         if self.is_remote_terminal {
             // We can't yet reliably detect the working directory of a shell on the
             // SSH host. Until we can do that, it doesn't make sense to display
             // the working directory on the client and persist that.
-            None
-        } else {
-            self.client_side_working_directory()
+            return None;
         }
+        match self.current_working_directory_report() {
+            Some(report) => report.path.clone(),
+            None => self.client_side_working_directory(),
+        }
+    }
+
+    fn current_working_directory_report(&self) -> Option<&ReportedWorkingDirectory> {
+        let shell = self
+            .pid_getter()
+            .map(|pid_getter| pid_getter.fallback_pid());
+        self.reported_working_directory
+            .as_ref()
+            .filter(|report| report.holds(self.pid(), shell))
     }
 
     /// The working directory of the shell the terminal started, unlike
@@ -3261,8 +3316,37 @@ impl Terminal {
         }
     }
 
-    pub(crate) fn record_cwd_change(&mut self, new_working_directory: PathBuf) {
+    fn report_working_directory(&mut self, report: Option<WorkingDirectoryReport>) {
         if self.is_remote_terminal {
+            return;
+        }
+        self.reported_working_directory = report.map(|report| ReportedWorkingDirectory {
+            path: self.is_this_host(&report.host).then_some(report.path),
+            sender: self.pid(),
+        });
+        self.record_working_directory();
+    }
+
+    fn is_this_host(&self, host: &str) -> bool {
+        host == "localhost"
+            || self.host_name.as_deref() == Some(host)
+            || sysinfo::System::host_name().as_deref() == Some(host)
+    }
+
+    /// Adds the working directory to the history if it changed.
+    pub(crate) fn record_working_directory(&mut self) {
+        if let Some(working_directory) = self.working_directory() {
+            self.record_cwd_change(working_directory);
+        }
+    }
+
+    fn record_cwd_change(&mut self, new_working_directory: PathBuf) {
+        if self.is_remote_terminal
+            || self
+                .cwd_history
+                .last()
+                .is_some_and(|entry| entry.working_directory == new_working_directory)
+        {
             return;
         }
 
@@ -5335,6 +5419,7 @@ mod tests {
         let terminal = display_only_terminal(cx);
         terminal.update(cx, |terminal, cx| {
             terminal.write_raw_output(b"\x1b]0;stale\x07\x1b[", cx);
+            terminal.report_working_directory(working_directory_report("localhost", "/stale"));
             terminal
                 .replace_display_output(b"fresh", cx)
                 .expect("replace");
@@ -5344,6 +5429,7 @@ mod tests {
         terminal.read_with(cx, |terminal, _| {
             assert_eq!(terminal.get_content().trim(), "fresh!");
             assert!(terminal.breadcrumb_text.is_empty());
+            assert_eq!(terminal.working_directory(), None);
         });
         terminal.update(cx, |terminal, cx| {
             terminal.write_raw_output(b"\xc3", cx);
@@ -6703,6 +6789,108 @@ mod tests {
         assert_eq!(terminal.pending_cwd_boundary, None);
         assert!(terminal.cwd_history.is_empty());
         assert_eq!(terminal.cwd_at_line(0, 0), None);
+    }
+
+    fn working_directory_report(host: &str, path: &str) -> Option<WorkingDirectoryReport> {
+        Some(WorkingDirectoryReport {
+            host: host.to_owned(),
+            path: PathBuf::from(path),
+        })
+    }
+
+    #[test]
+    fn test_shell_report_on_this_machine_sets_working_directory() {
+        let mut terminal = make_display_only_terminal();
+        terminal.report_working_directory(working_directory_report("localhost", "/a"));
+        assert_eq!(terminal.working_directory(), Some(PathBuf::from("/a")));
+
+        if let Some(host_name) = sysinfo::System::host_name() {
+            terminal.report_working_directory(working_directory_report(&host_name, "/b"));
+            assert_eq!(terminal.working_directory(), Some(PathBuf::from("/b")));
+        }
+
+        terminal.host_name = Some("name-at-start".to_owned());
+        terminal.report_working_directory(working_directory_report("name-at-start", "/c"));
+        assert_eq!(terminal.working_directory(), Some(PathBuf::from("/c")));
+
+        terminal.report_working_directory(None);
+        assert_eq!(terminal.reported_working_directory, None);
+    }
+
+    #[test]
+    fn test_shell_report_from_another_host_has_no_local_directory() {
+        let mut terminal = make_display_only_terminal();
+        terminal.report_working_directory(working_directory_report("localhost", "/a"));
+        terminal.report_working_directory(working_directory_report("devbox", "/srv"));
+        assert_eq!(
+            terminal.current_working_directory_report(),
+            Some(&ReportedWorkingDirectory {
+                path: None,
+                sender: None,
+            })
+        );
+
+        terminal.report_working_directory(working_directory_report("localhost", "/a"));
+        assert_eq!(terminal.working_directory(), Some(PathBuf::from("/a")));
+        assert_eq!(
+            terminal.cwd_history,
+            vec![CwdHistoryEntry {
+                scrollback_position: 0,
+                working_directory: PathBuf::from("/a"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_shell_report_holds_while_the_shell_that_sent_it_is_in_the_foreground() {
+        let shell = Some(sysinfo::Pid::from_u32(10));
+        let nested = Some(sysinfo::Pid::from_u32(11));
+        let report = |path: Option<&str>, sender| ReportedWorkingDirectory {
+            path: path.map(PathBuf::from),
+            sender,
+        };
+
+        assert!(report(Some("/a"), shell).holds(shell, shell));
+        // A nested shell or program took the foreground.
+        assert!(!report(Some("/a"), shell).holds(nested, shell));
+        // A nested shell's report, or one read after a program took the foreground.
+        assert!(!report(Some("/a"), nested).holds(nested, shell));
+        assert!(!report(Some("/a"), nested).holds(shell, shell));
+        // `ssh` reports another host's directory until it exits.
+        assert!(report(None, nested).holds(nested, shell));
+        assert!(!report(None, nested).holds(shell, shell));
+        // A display-only terminal has no processes.
+        assert!(report(Some("/a"), None).holds(None, None));
+    }
+
+    #[test]
+    fn test_remote_terminal_ignores_shell_reports() {
+        let mut terminal = make_display_only_terminal();
+        terminal.is_remote_terminal = true;
+        terminal.report_working_directory(working_directory_report("devbox", "/srv"));
+
+        assert_eq!(terminal.reported_working_directory, None);
+        assert_eq!(terminal.working_directory(), None);
+        assert!(terminal.cwd_history.is_empty());
+    }
+
+    #[test]
+    fn test_unchanged_directory_keeps_command_boundary() {
+        let mut terminal = make_display_only_terminal();
+        terminal.pending_cwd_boundary = Some(-3);
+        terminal.report_working_directory(working_directory_report("localhost", "/b"));
+        assert_eq!(terminal.pending_cwd_boundary, None);
+
+        terminal.pending_cwd_boundary = Some(-1);
+        terminal.record_working_directory();
+        assert_eq!(terminal.pending_cwd_boundary, Some(-1));
+        assert_eq!(
+            terminal.cwd_history,
+            vec![CwdHistoryEntry {
+                scrollback_position: -3,
+                working_directory: PathBuf::from("/b"),
+            }]
+        );
     }
 
     #[test]

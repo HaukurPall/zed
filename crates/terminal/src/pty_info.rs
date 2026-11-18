@@ -217,23 +217,15 @@ impl PtyProcessInfo {
                 _ => true,
             };
             if has_changed {
-                *this.current.write() = current.clone();
+                *this.current.write() = current;
             }
-            let changed_cwd = match (previous.as_ref(), current.as_ref()) {
-                (Some(prev), Some(now)) if prev.cwd != now.cwd => Some(now.cwd.clone()),
-                (None, Some(now)) => Some(now.cwd.clone()),
-                _ => None,
-            };
-            (has_changed, changed_cwd)
+            has_changed
         });
         let this = Arc::downgrade(self);
         *self.task.lock() = Some(cx.spawn(async move |term, cx| {
-            let (has_changed, new_cwd) = change_task.await;
-            if has_changed {
+            if change_task.await {
                 term.update(cx, |terminal, cx| {
-                    if let Some(cwd) = new_cwd {
-                        terminal.record_cwd_change(cwd);
-                    }
+                    terminal.record_working_directory();
                     cx.emit(Event::TitleChanged);
                 })
                 .ok();
