@@ -1391,6 +1391,13 @@
     },
   },
   {
+    "context": "Terminal && prompt_marks && screen == normal",
+    "bindings": {
+      "ctrl-shift-up": "terminal::ScrollToPreviousPrompt",
+      "ctrl-shift-down": "terminal::ScrollToNextPrompt",
+    },
+  },
+  {
     "context": "Terminal && selection",
     "bindings": {
       "ctrl-c": "terminal::Copy",

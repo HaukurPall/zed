@@ -34,10 +34,11 @@ use std::{
 };
 use task::TaskId;
 use terminal::{
-    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
-    PasteText, Point, ProgramState, ProgressState, Range, ScrollLineDown, ScrollLineUp,
-    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette,
-    TaskState, TaskStatus, Terminal, TerminalBounds, TerminalStatus, ToggleViMode,
+    Clear, Copy, CopyLastCommandOutput, Event, HoveredWord, MaybeNavigationTarget, Modes,
+    MouseInputMode, Paste, PasteText, Point, ProgramState, ProgressState, Range, ScrollLineDown,
+    ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToNextPrompt,
+    ScrollToPreviousPrompt, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus,
+    Terminal, TerminalBounds, TerminalStatus, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -607,6 +608,11 @@ impl TerminalView {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
+        let has_command_output = self
+            .terminal
+            .read(cx)
+            .command_output_at_position(position)
+            .is_some();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -626,6 +632,20 @@ impl TerminalView {
                     },
                 )
                 .action("Select All", Box::new(SelectAll))
+                .when(has_command_output, |menu| {
+                    let terminal = self.terminal.clone();
+                    menu.entry("Select Command Output", None, move |_, cx| {
+                        terminal.update(cx, |terminal, cx| {
+                            // Looked up again: output may have arrived while the
+                            // menu was open, and a scrolled-back view keeps
+                            // showing the same lines under the click.
+                            if let Some(output) = terminal.command_output_at_position(position) {
+                                terminal.select_range(output);
+                                cx.notify();
+                            }
+                        });
+                    })
+                })
                 .when(
                     !self.read_only && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| menu.action("Clear", Box::new(Clear)),
@@ -926,6 +946,54 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn scroll_to_previous_prompt(
+        &mut self,
+        _: &ScrollToPreviousPrompt,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_alt_screen(cx) {
+            cx.propagate();
+            return;
+        }
+
+        self.terminal
+            .update(cx, |term, _| term.scroll_to_previous_prompt());
+        cx.notify();
+    }
+
+    fn scroll_to_next_prompt(
+        &mut self,
+        _: &ScrollToNextPrompt,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_alt_screen(cx) {
+            cx.propagate();
+            return;
+        }
+
+        self.terminal
+            .update(cx, |term, _| term.scroll_to_next_prompt());
+        cx.notify();
+    }
+
+    fn copy_last_command_output(
+        &mut self,
+        _: &CopyLastCommandOutput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_alt_screen(cx) {
+            cx.propagate();
+            return;
+        }
+
+        self.terminal
+            .update(cx, |term, _| term.copy_last_command_output());
+        cx.notify();
+    }
+
     fn toggle_vi_mode(&mut self, _: &ToggleViMode, _: &mut Window, cx: &mut Context<Self>) {
         self.terminal.update(cx, |term, _| term.toggle_vi_mode());
         cx.notify();
@@ -1107,6 +1175,10 @@ impl TerminalView {
             dispatch_context.add("vi_mode");
         }
 
+        if self.terminal.read(cx).has_prompt_marks() {
+            dispatch_context.add("prompt_marks");
+        }
+
         let mode = self.terminal.read(cx).last_content.mode;
         dispatch_context.set(
             "screen",
@@ -1224,6 +1296,7 @@ fn status_icon(terminal: &Terminal) -> (IconName, Color, bool) {
             ProgramState::Error => (IconName::XCircle, Color::Error, false),
             ProgramState::Idle => (IconName::Terminal, Color::Muted, false),
         },
+        Some(TerminalStatus::CommandFailed(_)) => (IconName::XCircle, Color::Error, false),
         Some(TerminalStatus::Progress(progress)) => match progress.state {
             ProgressState::Normal | ProgressState::Indeterminate => {
                 (IconName::LoadCircle, Color::Muted, true)
@@ -1235,6 +1308,9 @@ fn status_icon(terminal: &Terminal) -> (IconName, Color, bool) {
     }
 }
 
+/// Keeps a pasted script from filling the tab tooltip.
+const MAX_FAILED_COMMAND_CHARS: usize = 60;
+
 /// What the terminal's program reports, for the tab tooltip.
 fn status_text(terminal: &Terminal) -> Option<String> {
     let mut parts = Vec::new();
@@ -1242,6 +1318,14 @@ fn status_text(terminal: &Terminal) -> Option<String> {
         TerminalStatus::Program(record) => {
             parts.extend([record.app, record.title, record.message]);
             record.progress
+        }
+        TerminalStatus::CommandFailed(failed) => {
+            let command = if failed.command.is_empty() {
+                "Command".to_owned()
+            } else {
+                util::truncate_and_trailoff(&failed.command, MAX_FAILED_COMMAND_CHARS)
+            };
+            return Some(format!("{command} exited with {}", failed.exit_code));
         }
         TerminalStatus::Progress(progress) => progress.percent,
     };
@@ -1551,6 +1635,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::scroll_page_down))
             .on_action(cx.listener(TerminalView::scroll_to_top))
             .on_action(cx.listener(TerminalView::scroll_to_bottom))
+            .on_action(cx.listener(TerminalView::scroll_to_previous_prompt))
+            .on_action(cx.listener(TerminalView::scroll_to_next_prompt))
+            .on_action(cx.listener(TerminalView::copy_last_command_output))
             .on_action(cx.listener(TerminalView::toggle_vi_mode))
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))

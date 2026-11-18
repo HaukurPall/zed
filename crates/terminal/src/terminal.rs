@@ -15,7 +15,8 @@ pub mod terminal_settings;
 
 use program_status::ProgramStatusRecords;
 pub use program_status::{
-    ProgramState, ProgramStatusReport, ProgressState, TerminalProgress, TerminalStatus,
+    FailedCommand, ProgramState, ProgramStatusReport, ProgressState, TerminalProgress,
+    TerminalStatus,
 };
 
 #[cfg(not(windows))]
@@ -78,12 +79,13 @@ use crate::backend::current_child_signal_mask;
 use crate::backend::{
     CellData, GridIter, HyperlinkHandle, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
     SearchData, Term, TermConfig, TermLock, append_text_to_term, apply_config, clear_saved_screen,
-    content_text, cursor_blinking, cursor_line, display_offset, display_only_term_config,
-    encode_key, find_from_terminal_point, full_content_range, history_size, last_non_empty_lines,
-    make_content, new_term, open_pty, palette_color, pty_options, pty_term_config,
-    renderable_cells, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
-    selection_text, set_default_cursor_style, set_selection as set_term_selection, set_theme,
-    shrink_to_used, spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    command_output_at, content_text, cursor_blinking, cursor_line, display_offset,
+    display_only_term_config, encode_key, find_from_terminal_point, full_content_range,
+    history_size, last_command_output, last_non_empty_lines, make_content, new_term, open_pty,
+    palette_color, pty_options, pty_term_config, renderable_cells, resize, screen_lines,
+    scroll_display, scroll_to_point, scroll_to_prompt, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, set_theme, shrink_to_used,
+    spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode, total_lines,
     update_selection as update_term_selection, update_selection_to_vi_cursor,
     update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
@@ -741,6 +743,15 @@ actions!(
         ScrollToTop,
         /// Scrolls to the bottom of the terminal buffer.
         ScrollToBottom,
+        /// Scrolls to the previous shell prompt. Needs a shell that marks its
+        /// prompts (OSC 133).
+        ScrollToPreviousPrompt,
+        /// Scrolls to the next shell prompt. Needs a shell that marks its
+        /// prompts (OSC 133).
+        ScrollToNextPrompt,
+        /// Selects and copies the output of the last command that finished.
+        /// Needs a shell that marks its prompts (OSC 133).
+        CopyLastCommandOutput,
         /// Toggles vi mode in the terminal.
         ToggleViMode,
         /// Selects all text in the terminal.
@@ -814,6 +825,8 @@ enum InternalEvent {
     // FocusNextMatch,
     Scroll(Scroll),
     ScrollToPoint(Point),
+    /// Scrolls by this many prompts, back into history when negative.
+    ScrollToPrompt(isize),
     SetSelection(Option<Selection>),
     UpdateSelection(GpuiPoint<Pixels>),
     FindHyperlink(GpuiPoint<Pixels>, bool),
@@ -862,6 +875,12 @@ pub(crate) enum TerminalBackendEvent {
     ProgramStatusClear(String),
     #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
     PromptStart,
+    /// The shell started a command, with its command line when the shell sent one.
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    CommandStart(String),
+    /// The shell's command ended, with its exit code when the shell sent one.
+    #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
+    CommandEnd(Option<i32>),
     /// The shell's working directory (OSC 7), or `None` when the shell withdraws its report.
     #[cfg_attr(not(feature = "ghostty"), expect(dead_code, reason = "ghostty only"))]
     WorkingDirectory(Option<WorkingDirectoryReport>),
@@ -918,6 +937,8 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::ProgramStatus(report) => write!(f, "ProgramStatus({report:?})"),
             Self::ProgramStatusClear(id) => write!(f, "ProgramStatusClear({id:?})"),
             Self::PromptStart => f.write_str("PromptStart"),
+            Self::CommandStart(command) => write!(f, "CommandStart({command:?})"),
+            Self::CommandEnd(exit_code) => write!(f, "CommandEnd({exit_code:?})"),
             Self::WorkingDirectory(report) => write!(f, "WorkingDirectory({report:?})"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
@@ -1216,6 +1237,9 @@ impl TerminalBuilder {
             breadcrumb_text: String::new(),
             progress: None,
             program_status: ProgramStatusRecords::default(),
+            has_prompt_marks: false,
+            running_command: None,
+            failed_command: None,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -1509,6 +1533,9 @@ impl TerminalBuilder {
                 breadcrumb_text: String::new(),
                 progress: None,
                 program_status: ProgramStatusRecords::default(),
+                has_prompt_marks: false,
+                running_command: None,
+                failed_command: None,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1725,6 +1752,12 @@ pub struct Terminal {
     pub breadcrumb_text: String,
     progress: Option<TerminalProgress>,
     program_status: ProgramStatusRecords,
+    /// Whether the shell the terminal started marks its prompts and commands (OSC 133).
+    has_prompt_marks: bool,
+    /// The command line of the shell's running command, from its prompt marks.
+    running_command: Option<String>,
+    /// The shell's last failed command, until the user has seen it.
+    failed_command: Option<FailedCommand>,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1906,7 +1939,29 @@ impl Terminal {
                 self.program_status.clear(&id);
                 cx.emit(Event::StatusChanged);
             }
-            TerminalBackendEvent::PromptStart => self.clear_running_status(cx),
+            TerminalBackendEvent::PromptStart => {
+                self.note_prompt_mark();
+                self.running_command = None;
+                self.clear_running_status(cx);
+            }
+            TerminalBackendEvent::CommandStart(command) => {
+                self.note_prompt_mark();
+                self.running_command = Some(command);
+                if self.failed_command.take().is_some() {
+                    cx.emit(Event::StatusChanged);
+                }
+            }
+            TerminalBackendEvent::CommandEnd(exit_code) => {
+                self.note_prompt_mark();
+                // Shells also end a prompt where no command ran, with the last command's code.
+                if let Some(command) = self.running_command.take()
+                    && let Some(exit_code) = exit_code.filter(|&exit_code| exit_code != 0)
+                {
+                    self.failed_command = Some(FailedCommand { command, exit_code });
+                    cx.emit(Event::StatusChanged);
+                }
+                self.clear_running_status(cx);
+            }
             TerminalBackendEvent::WorkingDirectory(report) => self.report_working_directory(report),
             TerminalBackendEvent::Exit => {
                 self.clear_running_status(cx);
@@ -1923,8 +1978,9 @@ impl Terminal {
                     info.emit_title_changed_if_changed(cx);
                     // Shells without prompt marks don't say when a program ended,
                     // but the shell is in the foreground again once it has.
-                    if self.has_running_status()
-                        && info.pid() == Some(info.pid_getter().fallback_pid())
+                    if !self.has_prompt_marks
+                        && self.has_running_status()
+                        && self.is_shell_in_foreground()
                     {
                         self.clear_running_status(cx);
                     }
@@ -1955,6 +2011,23 @@ impl Terminal {
         self.progress.is_some() || self.program_status.has_running()
     }
 
+    /// Marks count only from the shell the terminal started: a shell nested in
+    /// it, an `ssh` session or a replayed recording may send them where this
+    /// shell never will.
+    fn note_prompt_mark(&mut self) {
+        if !self.has_prompt_marks && self.is_shell_in_foreground() {
+            self.has_prompt_marks = true;
+        }
+    }
+
+    /// A display-only terminal has no processes, so its output counts as the shell's.
+    fn is_shell_in_foreground(&self) -> bool {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.pid() == Some(info.pid_getter().fallback_pid()),
+            TerminalType::DisplayOnly => true,
+        }
+    }
+
     /// Removes progress and status records of work that ends with its program.
     fn clear_running_status(&mut self, cx: &mut Context<Self>) {
         let cleared_progress = self.progress.take().is_some();
@@ -1965,19 +2038,37 @@ impl Terminal {
 
     /// Removes status records of finished work, once the user has seen them.
     pub fn clear_finished_status(&mut self, cx: &mut Context<Self>) {
-        if self.program_status.clear_finished() {
+        let cleared_failed_command = self.failed_command.take().is_some();
+        if self.program_status.clear_finished() || cleared_failed_command {
             cx.emit(Event::StatusChanged);
         }
     }
 
     /// What to show about the program's work: the status record that most needs
-    /// the user, else the progress it reported.
+    /// the user, else the shell's failed command, else the progress the program
+    /// reported. A failed command outranks a record of finished work.
     pub fn status(&self) -> Option<TerminalStatus> {
-        self.program_status
+        let failed_command = || {
+            self.failed_command
+                .clone()
+                .map(TerminalStatus::CommandFailed)
+        };
+        match self
+            .program_status
             .most_urgent()
             .filter(|record| record.state != ProgramState::Idle)
-            .map(TerminalStatus::Program)
-            .or_else(|| self.progress.map(TerminalStatus::Progress))
+        {
+            Some(record) if record.state == ProgramState::Done => {
+                failed_command().or(Some(TerminalStatus::Program(record)))
+            }
+            Some(record) => Some(TerminalStatus::Program(record)),
+            None => failed_command().or_else(|| self.progress.map(TerminalStatus::Progress)),
+        }
+    }
+
+    /// Whether the shell has marked its prompts and commands (OSC 133).
+    pub fn has_prompt_marks(&self) -> bool {
+        self.has_prompt_marks
     }
 
     pub fn selection_started(&self) -> bool {
@@ -2091,6 +2182,11 @@ impl Terminal {
             InternalEvent::ScrollToPoint(point) => {
                 trace!("Scrolling to point: point={point:?}");
                 scroll_to_point(term, *point);
+                self.refresh_hovered_word(window, cx);
+            }
+            InternalEvent::ScrollToPrompt(count) => {
+                trace!("Scrolling to prompt: count={count}");
+                scroll_to_prompt(term, *count);
                 self.refresh_hovered_word(window, cx);
             }
             InternalEvent::MoveViCursorToPoint(point) => {
@@ -2281,6 +2377,9 @@ impl Terminal {
         self.output_processor = None;
         self.progress = None;
         self.program_status = ProgramStatusRecords::default();
+        self.has_prompt_marks = false;
+        self.running_command = None;
+        self.failed_command = None;
         // The new emulator already has the latest requested size; older resizes can truncate it.
         self.events.clear();
         self.last_content = Content {
@@ -2370,6 +2469,40 @@ impl Terminal {
         self.events.push_back(InternalEvent::Copy(keep_selection));
     }
 
+    /// The output of the command at a window position, as the shell's prompt marks bound it.
+    pub fn command_output_at_position(&self, position: GpuiPoint<Pixels>) -> Option<Range> {
+        if !self.has_prompt_marks {
+            return None;
+        }
+        let term = self.term.lock();
+        let position = position - self.last_content.terminal_bounds.bounds.origin;
+        let point = grid_point(
+            position,
+            self.last_content.terminal_bounds,
+            display_offset(&term),
+        );
+        command_output_at(&term, point)
+    }
+
+    pub fn select_range(&mut self, range: Range) {
+        self.set_selection(Some(Selection::simple_range(range)));
+    }
+
+    /// Selects and copies the output of the newest finished command that printed any.
+    pub fn copy_last_command_output(&mut self) {
+        // Without prompt marks there is no command to find, and looking for one
+        // would read every row of the scrollback.
+        if !self.has_prompt_marks {
+            return;
+        }
+        let Some(output) = last_command_output(&self.term.lock()) else {
+            return;
+        };
+        self.select_range(output);
+        // The selection shows what was copied.
+        self.copy(Some(true));
+    }
+
     pub fn clear(&mut self) {
         self.events.push_back(InternalEvent::Clear)
     }
@@ -2413,6 +2546,14 @@ impl Terminal {
 
     pub fn scroll_to_bottom(&mut self) {
         self.events.push_back(InternalEvent::Scroll(Scroll::Bottom));
+    }
+
+    pub fn scroll_to_previous_prompt(&mut self) {
+        self.events.push_back(InternalEvent::ScrollToPrompt(-1));
+    }
+
+    pub fn scroll_to_next_prompt(&mut self) {
+        self.events.push_back(InternalEvent::ScrollToPrompt(1));
     }
 
     pub fn scrolled_to_top(&self) -> bool {
@@ -6671,6 +6812,108 @@ mod tests {
             PathStyle::local(),
         )
         .terminal
+    }
+
+    // Only the ghostty backend reports prompt marks.
+    #[cfg(feature = "ghostty")]
+    #[gpui::test]
+    async fn test_prompt_marks_mark_failed_commands(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            assert!(!terminal.has_prompt_marks());
+            terminal.process_event(TerminalBackendEvent::PromptStart, cx);
+            assert!(terminal.has_prompt_marks());
+
+            terminal.process_event(TerminalBackendEvent::CommandStart("false".to_owned()), cx);
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(1)), cx);
+            assert_eq!(
+                terminal.status(),
+                Some(TerminalStatus::CommandFailed(FailedCommand {
+                    command: "false".to_owned(),
+                    exit_code: 1,
+                }))
+            );
+
+            // The next command removes the mark.
+            terminal.process_event(TerminalBackendEvent::PromptStart, cx);
+            terminal.process_event(TerminalBackendEvent::CommandStart("true".to_owned()), cx);
+            assert_eq!(terminal.status(), None);
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(0)), cx);
+            assert_eq!(terminal.status(), None);
+
+            // An end without a command repeats the last command's code.
+            terminal.process_event(TerminalBackendEvent::PromptStart, cx);
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(1)), cx);
+            assert_eq!(terminal.status(), None);
+
+            terminal.process_event(TerminalBackendEvent::CommandStart(String::new()), cx);
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(2)), cx);
+            assert!(matches!(
+                terminal.status(),
+                Some(TerminalStatus::CommandFailed(_))
+            ));
+            terminal.clear_finished_status(cx);
+            assert_eq!(terminal.status(), None);
+
+            terminal.process_event(TerminalBackendEvent::CommandStart("sleep".to_owned()), cx);
+            terminal.process_event(TerminalBackendEvent::CommandEnd(None), cx);
+            assert_eq!(terminal.status(), None);
+        });
+    }
+
+    #[cfg(feature = "ghostty")]
+    #[gpui::test]
+    async fn test_failed_command_outranks_finished_work(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            let report = |state| ProgramStatusReport {
+                id: String::new(),
+                state,
+                progress: None,
+                app: "cargo".to_owned(),
+                title: String::new(),
+                message: String::new(),
+            };
+            terminal.process_event(
+                TerminalBackendEvent::CommandStart("cargo test && false".to_owned()),
+                cx,
+            );
+            terminal.process_event(
+                TerminalBackendEvent::ProgramStatus(report(ProgramState::Done)),
+                cx,
+            );
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(1)), cx);
+            assert!(matches!(
+                terminal.status(),
+                Some(TerminalStatus::CommandFailed(_))
+            ));
+
+            terminal.process_event(
+                TerminalBackendEvent::ProgramStatus(report(ProgramState::Error)),
+                cx,
+            );
+            assert_eq!(
+                terminal.status(),
+                Some(TerminalStatus::Program(report(ProgramState::Error)))
+            );
+        });
+    }
+
+    #[cfg(feature = "ghostty")]
+    #[gpui::test]
+    async fn test_command_end_clears_running_status(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.process_event(TerminalBackendEvent::CommandStart("make".to_owned()), cx);
+            let progress = TerminalProgress {
+                state: ProgressState::Normal,
+                percent: Some(40),
+            };
+            terminal.process_event(TerminalBackendEvent::Progress(Some(progress)), cx);
+            assert_eq!(terminal.status(), Some(TerminalStatus::Progress(progress)));
+            terminal.process_event(TerminalBackendEvent::CommandEnd(Some(0)), cx);
+            assert_eq!(terminal.status(), None);
+        });
     }
 
     #[test]

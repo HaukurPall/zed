@@ -1,5 +1,6 @@
-//! What programs in a terminal report about their work: progress (OSC 9;4) and
-//! program status (OSC 7501, <https://www.superlogical.com/rex/docs/build/program-status>).
+//! What programs in a terminal report about their work: progress (OSC 9;4),
+//! program status (OSC 7501, <https://www.superlogical.com/rex/docs/build/program-status>)
+//! and the shell's failed commands (OSC 133).
 
 /// Progress reported with OSC 9;4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,10 +51,19 @@ impl ProgramStatusReport {
     }
 }
 
+/// A shell command that exited with a nonzero code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedCommand {
+    /// Empty when the shell didn't report the command line.
+    pub command: String,
+    pub exit_code: i32,
+}
+
 /// What a terminal shows about the work of the program running in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalStatus {
     Program(ProgramStatusReport),
+    CommandFailed(FailedCommand),
     Progress(TerminalProgress),
 }
 

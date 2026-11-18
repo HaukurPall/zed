@@ -44,7 +44,7 @@ use libghostty_vt::{
         CellIterator, CursorVisualStyle, Dirty, ImageIterator, ImageLayer, ImageProtocol,
         RenderState, RowId, RowIteration, RowIterator, Snapshot,
     },
-    screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
+    screen::{CellContentTag, CellWide, GridRef, RowSemanticPrompt, Screen, TrackedGridRef},
     search::{MatchBuffer, Search as GhosttySearch},
     selection::Selection as GhosttySelection,
     style::{Palette, RgbColor, Style, StyleColor, Underline},
@@ -627,10 +627,21 @@ pub(super) fn new_term(
         .expect("register program status callback");
     let sink = events.clone();
     terminal
-        .on_semantic_prompt(move |_, event| {
-            if let Ok(SemanticPromptKind::PromptStart) = event.kind() {
-                sink.send(TerminalBackendEvent::PromptStart);
+        .on_semantic_prompt(move |_, event| match event.kind() {
+            Ok(SemanticPromptKind::PromptStart) => sink.send(TerminalBackendEvent::PromptStart),
+            Ok(SemanticPromptKind::OutputStart) => {
+                let command = event
+                    .command()
+                    .split(|&byte| byte == b'\n')
+                    .map(display_text)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                sink.send(TerminalBackendEvent::CommandStart(command));
             }
+            Ok(SemanticPromptKind::CommandEnd) => {
+                sink.send(TerminalBackendEvent::CommandEnd(event.exit_code()))
+            }
+            _ => {}
         })
         .expect("register semantic prompt callback");
     let sink = events.clone();
@@ -1068,6 +1079,14 @@ fn zed_point(term: &Term, coordinate: PointCoordinate) -> Point {
     )
 }
 
+/// `None` when the cell is not on the active screen.
+fn grid_ref_point(term: &Term, grid_ref: &GridRef<'_>) -> Option<Point> {
+    term.terminal
+        .point_from_grid_ref(grid_ref, PointSpace::Screen)
+        .expect("resolve grid point")
+        .map(|coordinate| zed_point(term, coordinate))
+}
+
 pub(super) fn display_offset(term: &Term) -> usize {
     viewport_offset(&term.terminal)
 }
@@ -1158,6 +1177,59 @@ pub(super) fn scroll_to_point(term: &mut Term, point: Point) {
 fn display_top_row(term: &Term) -> usize {
     let scrollbar = term.terminal.scrollbar().expect("read scrollbar");
     scrollbar.offset as usize
+}
+
+/// Scrolls by `count` of the shell's prompts, back into history when negative.
+pub(super) fn scroll_to_prompt(term: &mut Term, count: isize) {
+    term.terminal
+        .scroll_viewport(ScrollViewport::DeltaPrompt(count));
+}
+
+// --- Command output ---
+
+/// The output of the command at `point`, as the shell's prompt marks bound it.
+pub(super) fn command_output_at(term: &Term, point: Point) -> Option<Range> {
+    let grid_ref = term
+        .terminal
+        .grid_ref(screen_point(term, point))
+        .expect("resolve command output point");
+    let output = term
+        .terminal
+        .select_output(grid_ref)
+        .expect("select command output")?;
+    Some(Range::new(
+        grid_ref_point(term, &output.start())?,
+        grid_ref_point(term, &output.end())?,
+    ))
+}
+
+/// The output of the newest command above the cursor's prompt that printed any,
+/// so prompts left by an empty command line or Ctrl-C are passed over.
+pub(super) fn last_command_output(term: &Term) -> Option<Range> {
+    let first_line = -(history_rows(term) as i32);
+    let last_column = screen_columns(term).saturating_sub(1);
+    // The first row of the prompt below the one being looked at; a command's
+    // output ends on the row above it. Text above the oldest prompt, such as a
+    // login banner, belongs to no command.
+    let mut next_prompt_line = None;
+    for line in (first_line..=cursor_line(term)).rev() {
+        let mark = term
+            .terminal
+            .grid_ref(screen_point(term, Point::new(line, 0)))
+            .and_then(|grid_ref| grid_ref.row()?.semantic_prompt())
+            .expect("read row prompt mark");
+        if mark != RowSemanticPrompt::Prompt {
+            continue;
+        }
+        if let Some(next_prompt_line) = next_prompt_line
+            && let Some(output) =
+                command_output_at(term, Point::new(next_prompt_line - 1, last_column))
+        {
+            return Some(output);
+        }
+        next_prompt_line = Some(line);
+    }
+    None
 }
 
 // --- Selection ---
@@ -1390,13 +1462,10 @@ pub(super) fn selection_text(term: &Term) -> Option<String> {
 
 fn selection_range(term: &Term) -> Option<SelectionRange> {
     let selection = term.terminal.selection().expect("read selection")?;
-    let point = |grid_ref| {
-        term.terminal
-            .point_from_grid_ref(&grid_ref, PointSpace::Screen)
-            .expect("resolve selection point")
-            .map(|coordinate| zed_point(term, coordinate))
-    };
-    let (start, end) = (point(selection.start())?, point(selection.end())?);
+    let (start, end) = (
+        grid_ref_point(term, &selection.start())?,
+        grid_ref_point(term, &selection.end())?,
+    );
     Some(SelectionRange {
         start: start.min(end),
         end: start.max(end),
@@ -3429,6 +3498,107 @@ mod tests {
                 "WorkingDirectory(None)",
             ]
         );
+    }
+
+    #[test]
+    fn reports_commands_from_prompt_marks() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        term.terminal
+            .vt_write(b"\x1b]133;C;cmdline_url=cargo%20test%0A--all\x07");
+        term.terminal.vt_write(b"\x1b]133;D;101\x07\x1b]133;D\x07");
+        assert_eq!(
+            backend_events(&mut events),
+            [
+                "PromptStart",
+                "CommandStart(\"cargo test --all\")",
+                "CommandEnd(Some(101))",
+                "CommandEnd(None)",
+            ]
+        );
+    }
+
+    /// Runs `ls`, which prints two lines, as a shell with prompt marks would.
+    fn write_ls_command(term: &mut Term) {
+        term.terminal.vt_write(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\nb\r\n\x1b]133;D;0\x07\
+              \x1b]133;A\x07$ \x1b]133;B\x07",
+        );
+    }
+
+    /// Runs `true`, which prints nothing, at the prompt `write_ls_command` left.
+    fn write_true_command(term: &mut Term) {
+        term.terminal
+            .vt_write(b"true\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    }
+
+    #[test]
+    fn finds_command_output_by_prompt_marks() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        assert_eq!(last_command_output(&term), None);
+
+        write_ls_command(&mut term);
+        // On the 3-row screen "$ ls" is in history at line -1; "a" and "b" are lines 0 and 1.
+        let output = Range::new(Point::new(0, 0), Point::new(1, 0));
+        assert_eq!(last_command_output(&term), Some(output));
+        assert_eq!(command_output_at(&term, Point::new(1, 0)), Some(output));
+        set_selection(&mut term, Some(&Selection::simple_range(output)));
+        assert_eq!(selection_text(&term).as_deref(), Some("a\nb"));
+        assert_eq!(command_output_at(&term, Point::new(-1, 0)), None);
+        assert_eq!(command_output_at(&term, Point::new(-1, 3)), None);
+
+        // Lines: "$ ls" -2, "a" -1, "b" 0, "$ true" 1, "$ " 2.
+        write_true_command(&mut term);
+        let output = Range::new(Point::new(-1, 0), Point::new(0, 0));
+        assert_eq!(last_command_output(&term), Some(output));
+    }
+
+    #[test]
+    fn last_command_output_passes_over_prompts_without_output() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        write_ls_command(&mut term);
+        // An empty command line, and Ctrl-C at the prompt: no command runs.
+        term.terminal
+            .vt_write(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07^C\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        // Lines: "$ ls" -3, "a" -2, "b" -1, "$ " 0, "$ ^C" 1, "$ " 2.
+        let output = Range::new(Point::new(-2, 0), Point::new(-1, 0));
+        assert_eq!(last_command_output(&term), Some(output));
+    }
+
+    #[test]
+    fn last_command_output_ignores_text_above_the_first_prompt() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal
+            .vt_write(b"Welcome\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(last_command_output(&term), None);
+    }
+
+    #[test]
+    fn finds_no_command_output_without_prompt_marks() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"$ ls\r\na\r\nb\r\n$ ");
+        assert_eq!(last_command_output(&term), None);
+        assert_eq!(command_output_at(&term, Point::new(0, 0)), None);
+    }
+
+    #[test]
+    fn scrolls_to_prompts() {
+        let (term, _events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        write_ls_command(&mut term);
+        write_true_command(&mut term);
+        // Lines: "$ ls" -2, "a" -1, "b" 0, "$ true" 1, "$ " 2.
+        scroll_to_prompt(&mut term, -1);
+        assert_eq!(display_offset(&term), 2);
+        scroll_to_prompt(&mut term, -1);
+        assert_eq!(display_offset(&term), 2);
+        scroll_to_prompt(&mut term, 1);
+        assert_eq!(display_offset(&term), 0);
     }
 
     #[test]
