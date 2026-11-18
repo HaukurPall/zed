@@ -7,10 +7,11 @@ use std::{
     borrow::Cow,
     cell::{Cell as StdCell, RefCell},
     convert::Infallible,
+    ffi::OsString,
     io::{self, ErrorKind, Read, Write},
     num::NonZeroUsize,
     ops::Range as StdRange,
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::ffi::OsStringExt as _},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -66,7 +67,7 @@ use crate::{
     ProgramState, ProgramStatusReport, ProgressState, PtyEvent, Range, RenderableCells, Scroll,
     Search, Selection, SelectionAnchor, SelectionRange, SelectionSide, SelectionType,
     TerminalBackendEvent, TerminalBounds, TerminalImage, TerminalImageLayer, TerminalProgress,
-    ViMotion, adjusted_last_hovered_word, get_color_at_index,
+    ViMotion, WorkingDirectoryReport, adjusted_last_hovered_word, get_color_at_index,
     mappings::{colors::to_vte_rgb, keys::to_esc_str},
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
@@ -403,6 +404,34 @@ fn display_text(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Reads an OSC 7 report as libghostty stores it, unparsed: `file://host/path`
+/// with percent-encoding, or kitty's `kitty-shell-cwd://host/path` without.
+/// Like Ghostty, ignores reports without a host and bare paths (OSC 9;9 and
+/// OSC 1337 `CurrentDir`), which can't say which machine they are on.
+fn parse_working_directory_url(url: &[u8]) -> Option<WorkingDirectoryReport> {
+    let (location, percent_encoded) = if let Some(location) = url.strip_prefix(b"file://") {
+        (location, true)
+    } else {
+        (url.strip_prefix(b"kitty-shell-cwd://")?, false)
+    };
+    let path_start = location.iter().position(|&byte| byte == b'/')?;
+    let (host, path) = location.split_at(path_start);
+    if host.is_empty() {
+        return None;
+    }
+    let decode = |bytes: &[u8]| -> Vec<u8> {
+        if percent_encoded {
+            percent_encoding::percent_decode(bytes).collect()
+        } else {
+            bytes.to_vec()
+        }
+    };
+    Some(WorkingDirectoryReport {
+        host: String::from_utf8(decode(host)).ok()?,
+        path: PathBuf::from(OsString::from_vec(decode(path))),
+    })
+}
+
 /// Writes bytes after aborting any escape sequence a previous writer left unfinished.
 fn write_from_ground(terminal: &mut GhosttyTerminal<'static, 'static>, bytes: &[u8]) {
     if !terminal.is_vt_ground().expect("read parser state") {
@@ -604,6 +633,22 @@ pub(super) fn new_term(
             }
         })
         .expect("register semantic prompt callback");
+    let sink = events.clone();
+    terminal
+        .on_pwd_changed(move |terminal| {
+            let pwd = terminal.pwd().expect("read working directory");
+            if pwd.is_empty() {
+                sink.send(TerminalBackendEvent::WorkingDirectory(None));
+            } else if let Some(report) = parse_working_directory_url(pwd) {
+                sink.send(TerminalBackendEvent::WorkingDirectory(Some(report)));
+            } else {
+                log::debug!(
+                    "ignoring working directory report {:?}",
+                    String::from_utf8_lossy(pwd)
+                );
+            }
+        })
+        .expect("register working directory callback");
     if config.clipboard_writes {
         let sink = events.clone();
         terminal
@@ -3329,6 +3374,59 @@ mod tests {
                  progress: None, app: \"terraform\", title: \"\", message: \"Apply?\" })",
                 "ProgramStatusClear(\"\")",
                 "PromptStart",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_working_directory_reports() {
+        let report = |host: &str, path: &str| {
+            Some(WorkingDirectoryReport {
+                host: host.to_owned(),
+                path: PathBuf::from(path),
+            })
+        };
+        let cases: [(&[u8], Option<WorkingDirectoryReport>); 9] = [
+            (b"file://risi/home/me", report("risi", "/home/me")),
+            (b"file://risi/a%20b/%C3%A6", report("risi", "/a b/æ")),
+            (b"file://h%C3%B6st/tmp", report("höst", "/tmp")),
+            (b"file://risi/", report("risi", "/")),
+            (
+                b"kitty-shell-cwd://My Mac/a%20b",
+                report("My Mac", "/a%20b"),
+            ),
+            (b"file:///tmp", None),
+            (b"file://risi", None),
+            (b"/tmp", None),
+            (b"http://risi/tmp", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(
+                parse_working_directory_url(url),
+                expected,
+                "{}",
+                String::from_utf8_lossy(url)
+            );
+        }
+        assert_eq!(
+            parse_working_directory_url(b"file://risi/%FF")
+                .map(|report| report.path.into_os_string().into_vec()),
+            Some(b"/\xFF".to_vec())
+        );
+    }
+
+    #[test]
+    fn reports_working_directories() {
+        let (term, mut events) = test_term(SettingsCursorShape::Block);
+        let mut term = term.lock();
+        term.terminal.vt_write(b"\x1b]7;file://risi/tmp/a%20b\x07");
+        term.terminal.vt_write(b"\x1b]7;/tmp\x07");
+        term.terminal.vt_write(b"\x1b]7;\x07");
+        assert_eq!(
+            backend_events(&mut events),
+            [
+                "WorkingDirectory(Some(WorkingDirectoryReport { host: \"risi\", path: \"/tmp/a b\" }))",
+                "WorkingDirectory(None)",
             ]
         );
     }
