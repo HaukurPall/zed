@@ -1,6 +1,9 @@
 use gpui::{Context, Task};
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
@@ -77,13 +80,26 @@ pub(crate) struct PtyProcessInfo {
     system: RwLock<System>,
     refresh_kind: ProcessRefreshKind,
     pid_getter: ProcessIdGetter,
+    /// Set when the spawned child is `login`, which runs the shell as its own
+    /// child.
+    login_shell: Option<LoginShell>,
     last_foreground_pid: Mutex<Option<Pid>>,
     pub(crate) current: RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
 }
 
+#[derive(Default)]
+struct LoginShell {
+    /// Known once the shell has been seen in the foreground.
+    shell: OnceLock<Pid>,
+    /// The last foreground process group whose leader isn't `login`'s child.
+    /// A process never becomes `login`'s child later, so it isn't looked up
+    /// again.
+    not_shell: Mutex<Option<Pid>>,
+}
+
 impl PtyProcessInfo {
-    pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
+    pub(crate) fn new(pid_getter: ProcessIdGetter, shell_under_login: bool) -> PtyProcessInfo {
         // Task enumeration is on by default and would retain a `Process` entry
         // per thread, each pinning an open `/proc/<pid>/task/<tid>/stat` handle
         // on Linux (#58651).
@@ -108,6 +124,7 @@ impl PtyProcessInfo {
             system: RwLock::new(system),
             refresh_kind: process_refresh_kind,
             pid_getter,
+            login_shell: shell_under_login.then(LoginShell::default),
             last_foreground_pid: Mutex::new(None),
             current: RwLock::new(None),
             task: Mutex::new(None),
@@ -118,9 +135,49 @@ impl PtyProcessInfo {
         &self.pid_getter
     }
 
+    /// Whether `pid`, a foreground process group, is the shell the terminal
+    /// started.
+    pub(crate) fn is_shell(&self, pid: Pid) -> bool {
+        let child = self.pid_getter.fallback_pid();
+        if pid == child {
+            return true;
+        }
+        let Some(login_shell) = &self.login_shell else {
+            return false;
+        };
+        if let Some(shell) = login_shell.shell.get() {
+            return pid == *shell;
+        }
+        if *login_shell.not_shell.lock() == Some(pid) {
+            return false;
+        }
+        // `login` runs a single child, the shell, which moves to its own
+        // process group when it has job control.
+        if parent_pid(pid) == Some(child) {
+            return *login_shell.shell.get_or_init(|| pid) == pid;
+        }
+        *login_shell.not_shell.lock() = Some(pid);
+        false
+    }
+
+    /// The shell the terminal started, as far as it is known: under `login`,
+    /// `login` itself until the shell has been seen in the foreground.
+    fn shell_pid(&self) -> Pid {
+        self.login_shell
+            .as_ref()
+            .and_then(|login_shell| login_shell.shell.get())
+            .copied()
+            .unwrap_or_else(|| self.pid_getter.fallback_pid())
+    }
+
     fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
         let pid = self.pid_getter.pid()?;
-        let fallback_pid = self.pid_getter.fallback_pid();
+        let child = self.pid_getter.fallback_pid();
+        let shell = if self.is_shell(pid) {
+            pid
+        } else {
+            self.shell_pid()
+        };
         let mut system = self.system.write();
         // sysinfo never evicts processes that are absent from the refreshed pid
         // set, so entries for former foreground processes (each pinning an open
@@ -130,13 +187,10 @@ impl PtyProcessInfo {
         if self.last_foreground_pid.lock().replace(pid) != Some(pid) {
             *system = System::new();
         }
-        let pids = [pid, fallback_pid];
-        let pids = if pid == fallback_pid {
-            &pids[..1]
-        } else {
-            &pids[..]
-        };
-        system.refresh_processes_specifics(ProcessesToUpdate::Some(pids), true, self.refresh_kind);
+        let mut pids = vec![pid, child, shell];
+        pids.sort_unstable();
+        pids.dedup();
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, self.refresh_kind);
         drop(system);
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
@@ -146,10 +200,12 @@ impl PtyProcessInfo {
         RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
 
-    /// The working directory of the spawned child, usually the shell, as of the
-    /// last refresh.
-    pub(crate) fn child_cwd(&self) -> Option<PathBuf> {
-        self.get_child()?.cwd().map(PathBuf::from)
+    /// The working directory of the shell the terminal started, as of the last
+    /// refresh.
+    pub(crate) fn shell_cwd(&self) -> Option<PathBuf> {
+        let shell = self.shell_pid();
+        let system = self.system.read();
+        system.process(shell)?.cwd().map(PathBuf::from)
     }
 
     #[cfg(unix)]
@@ -241,6 +297,16 @@ impl PtyProcessInfo {
     }
 }
 
+fn parent_pid(pid: Pid) -> Option<Pid> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    system.process(pid)?.parent()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -257,7 +323,7 @@ mod tests {
         reason = "the test needs real short-lived child processes and may block"
     )]
     fn process_map_stays_bounded() {
-        let mut info = PtyProcessInfo::new(ProcessIdGetter::new(-1, std::process::id()));
+        let mut info = PtyProcessInfo::new(ProcessIdGetter::new(-1, std::process::id()), false);
         assert!(
             info.get_child().is_some(),
             "the spawned child must be inspectable for kill_child_process \
@@ -293,20 +359,83 @@ mod tests {
         clippy::disallowed_methods,
         reason = "the test needs a real child process and may block"
     )]
-    fn child_cwd_is_the_spawned_childs_directory() {
+    fn shell_cwd_is_the_spawned_childs_directory() {
         let directory = tempfile::tempdir().expect("create a temporary directory");
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .current_dir(directory.path())
             .spawn()
             .expect("failed to spawn child process");
-        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, child.id()));
+        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, child.id()), false);
         assert!(info.load_for_test().is_some());
         assert_eq!(
-            info.child_cwd(),
+            info.shell_cwd(),
             Some(directory.path().canonicalize().expect("canonicalize"))
         );
         child.kill().expect("failed to kill child process");
         child.wait().expect("failed to wait for child process");
+    }
+
+    /// `sh` stands in for `login`: it waits for the shell it runs, and an
+    /// interactive shell moves to its own process group.
+    #[test]
+    fn shell_under_login_is_the_child_of_login() {
+        use alacritty_terminal::tty::EventedReadWrite as _;
+        use std::io::Write as _;
+
+        let options = crate::pty_options(
+            Some((
+                "sh".to_owned(),
+                vec!["-c".to_owned(), "bash --norc --noprofile -i; :".to_owned()],
+            )),
+            None,
+            [("HISTFILE".to_owned(), String::new())],
+            None,
+        );
+        let mut pty =
+            crate::open_pty(&options, crate::TerminalBounds::default(), 0).expect("open a PTY");
+        let pid_getter = ProcessIdGetter::from(&pty);
+        let login = pid_getter.fallback_pid();
+        let info = PtyProcessInfo::new(pid_getter, true);
+
+        let shell = wait_for_foreground(&pid_getter, |pid| pid != login);
+        assert_eq!(parent_pid(shell), Some(login));
+        assert!(info.is_shell(shell));
+        assert!(!PtyProcessInfo::new(pid_getter, false).is_shell(shell));
+
+        pty.writer()
+            .write_all(b"cd / && sleep 30\n")
+            .expect("write to the PTY");
+        let command = wait_for_foreground(&pid_getter, |pid| pid != shell);
+        assert!(!info.is_shell(command));
+        assert!(info.load_for_test().is_some());
+        assert_eq!(info.shell_cwd(), Some(PathBuf::from("/")));
+
+        // The shell's job isn't taken for the shell before the shell is known.
+        let info = PtyProcessInfo::new(pid_getter, true);
+        assert!(!info.is_shell(command));
+        assert!(!info.is_shell(command));
+        assert!(info.is_shell(shell));
+
+        pty.writer().write_all(b"\x03").expect("write to the PTY");
+        wait_for_foreground(&pid_getter, |pid| pid == shell);
+        pty.writer()
+            .write_all(b"bash --norc --noprofile -i\n")
+            .expect("write to the PTY");
+        let nested_shell = wait_for_foreground(&pid_getter, |pid| pid != shell);
+        assert_eq!(parent_pid(nested_shell), Some(shell));
+        assert!(!info.is_shell(nested_shell));
+    }
+
+    fn wait_for_foreground(pid_getter: &ProcessIdGetter, condition: impl Fn(Pid) -> bool) -> Pid {
+        for _ in 0..500 {
+            if let Some(pid) = pid_getter.pid()
+                && condition(pid)
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the PTY's foreground process didn't change");
     }
 }

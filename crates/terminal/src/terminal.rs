@@ -911,8 +911,8 @@ impl ReportedWorkingDirectory {
     /// any other process is unreliable. A report from another host, which
     /// arrives long after `ssh` started, holds while its sender is in the
     /// foreground.
-    fn holds(&self, foreground: Option<sysinfo::Pid>, shell: Option<sysinfo::Pid>) -> bool {
-        self.sender == foreground && (self.path.is_none() || foreground == shell)
+    fn holds(&self, foreground: Option<sysinfo::Pid>, shell_in_foreground: bool) -> bool {
+        self.sender == foreground && (self.path.is_none() || shell_in_foreground)
     }
 }
 
@@ -1496,7 +1496,10 @@ impl TerminalBuilder {
                     }
                 };
 
-                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
+                // alacritty_terminal starts the macOS system shell through
+                // `/usr/bin/login`.
+                let shell_under_login = cfg!(target_os = "macos") && shell_params.is_none();
+                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty), shell_under_login);
 
                 //And connect them together
                 let pty_tx =
@@ -2020,10 +2023,15 @@ impl Terminal {
         }
     }
 
-    /// A display-only terminal has no processes, so its output counts as the shell's.
     fn is_shell_in_foreground(&self) -> bool {
+        self.is_shell(self.pid())
+    }
+
+    /// Whether `pid` is the shell the terminal started. A display-only terminal
+    /// has no processes, so its output counts as the shell's.
+    fn is_shell(&self, pid: Option<sysinfo::Pid>) -> bool {
         match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info.pid() == Some(info.pid_getter().fallback_pid()),
+            TerminalType::Pty { info, .. } => pid.is_some_and(|pid| info.is_shell(pid)),
             TerminalType::DisplayOnly => true,
         }
     }
@@ -3395,12 +3403,11 @@ impl Terminal {
     }
 
     fn current_working_directory_report(&self) -> Option<&ReportedWorkingDirectory> {
-        let shell = self
-            .pid_getter()
-            .map(|pid_getter| pid_getter.fallback_pid());
+        let foreground = self.pid();
+        let shell_in_foreground = self.is_shell(foreground);
         self.reported_working_directory
             .as_ref()
-            .filter(|report| report.holds(self.pid(), shell))
+            .filter(|report| report.holds(foreground, shell_in_foreground))
     }
 
     /// The working directory of the shell the terminal started, unlike
@@ -3410,7 +3417,7 @@ impl Terminal {
             return None;
         }
         match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info.child_cwd(),
+            TerminalType::Pty { info, .. } => info.shell_cwd(),
             TerminalType::DisplayOnly => None,
         }
     }
@@ -3427,9 +3434,7 @@ impl Terminal {
         }
         match &self.terminal_type {
             // Windows reports the shell's own process, whatever runs in it.
-            TerminalType::Pty { info, .. } if cfg!(unix) => {
-                Some(info.pid() == Some(info.pid_getter().fallback_pid()))
-            }
+            TerminalType::Pty { .. } if cfg!(unix) => Some(self.is_shell_in_foreground()),
             TerminalType::Pty { .. } | TerminalType::DisplayOnly => None,
         }
     }
@@ -7104,17 +7109,248 @@ mod tests {
             sender,
         };
 
-        assert!(report(Some("/a"), shell).holds(shell, shell));
+        assert!(report(Some("/a"), shell).holds(shell, true));
         // A nested shell or program took the foreground.
-        assert!(!report(Some("/a"), shell).holds(nested, shell));
+        assert!(!report(Some("/a"), shell).holds(nested, false));
         // A nested shell's report, or one read after a program took the foreground.
-        assert!(!report(Some("/a"), nested).holds(nested, shell));
-        assert!(!report(Some("/a"), nested).holds(shell, shell));
+        assert!(!report(Some("/a"), nested).holds(nested, false));
+        assert!(!report(Some("/a"), nested).holds(shell, true));
         // `ssh` reports another host's directory until it exits.
-        assert!(report(None, nested).holds(nested, shell));
-        assert!(!report(None, nested).holds(shell, shell));
+        assert!(report(None, nested).holds(nested, false));
+        assert!(!report(None, nested).holds(shell, true));
         // A display-only terminal has no processes.
-        assert!(report(Some("/a"), None).holds(None, None));
+        assert!(report(Some("/a"), None).holds(None, true));
+    }
+
+    /// An interactive bash, started directly or under `sh`, which stands in for
+    /// macOS's `login`: it waits for the shell it runs.
+    #[cfg(unix)]
+    async fn build_bash_terminal(cx: &mut TestAppContext, under_login: bool) -> Entity<Terminal> {
+        let (program, args) = if under_login {
+            (
+                "sh".to_owned(),
+                vec!["-c".to_owned(), "bash --norc --noprofile -i; :".to_owned()],
+            )
+        } else {
+            (
+                "bash".to_owned(),
+                vec![
+                    "--norc".to_owned(),
+                    "--noprofile".to_owned(),
+                    "-i".to_owned(),
+                ],
+            )
+        };
+        let mut env = HashMap::default();
+        env.insert("HISTFILE".to_owned(), String::new());
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    TerminalMode::interactive(),
+                    Shell::WithArguments {
+                        program,
+                        args,
+                        title_override: None,
+                    },
+                    env,
+                    SettingsCursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    Vec::new(),
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .expect("start bash");
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        if under_login {
+            terminal.update(cx, |terminal, _| {
+                let TerminalType::Pty { info, .. } = &mut terminal.terminal_type else {
+                    panic!("expected a PTY terminal");
+                };
+                *info = Arc::new(PtyProcessInfo::new(*info.pid_getter(), true));
+            });
+        }
+        // Under `login`, its process group is in the foreground until bash
+        // takes its own, and it counts as the shell.
+        let spawned_child = terminal.read_with(cx, |terminal, _| {
+            terminal.pid_getter().map(ProcessIdGetter::fallback_pid)
+        });
+        wait_until(&terminal, cx, "bash is in the foreground", |terminal| {
+            terminal.is_shell_in_foreground() && (!under_login || terminal.pid() != spawned_child)
+        })
+        .await;
+        terminal
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_shell_in_foreground(
+        terminal: &Entity<Terminal>,
+        expected: bool,
+        cx: &mut TestAppContext,
+    ) {
+        wait_until(
+            terminal,
+            cx,
+            &format!("is_shell_in_foreground is {expected}"),
+            |terminal| terminal.is_shell_in_foreground() == expected,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(
+        terminal: &Entity<Terminal>,
+        cx: &mut TestAppContext,
+        what: &str,
+        condition: impl Fn(&Terminal) -> bool,
+    ) {
+        for _ in 0..500 {
+            if terminal.read_with(cx, |terminal, _| condition(terminal)) {
+                return;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    #[cfg(unix)]
+    fn type_into(terminal: &Entity<Terminal>, text: &'static str, cx: &mut TestAppContext) {
+        terminal.update(cx, |terminal, _| terminal.input(text.as_bytes()));
+    }
+
+    #[cfg(all(unix, feature = "ghostty"))]
+    #[gpui::test]
+    async fn test_prompt_marks_count_only_while_the_shell_is_in_the_foreground(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        for under_login in [false, true] {
+            let terminal = build_bash_terminal(cx, under_login).await;
+            type_into(&terminal, "sleep 30\n", cx);
+            wait_for_shell_in_foreground(&terminal, false, cx).await;
+            terminal.update(cx, |terminal, cx| {
+                terminal.process_event(TerminalBackendEvent::PromptStart, cx);
+                assert!(!terminal.has_prompt_marks(), "under login: {under_login}");
+            });
+
+            type_into(&terminal, "\x03", cx);
+            wait_for_shell_in_foreground(&terminal, true, cx).await;
+            terminal.update(cx, |terminal, cx| {
+                terminal.process_event(TerminalBackendEvent::PromptStart, cx);
+                assert!(terminal.has_prompt_marks(), "under login: {under_login}");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_shell_report_holds_only_while_the_shell_is_in_the_foreground(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let reported = Some(PathBuf::from("/reported"));
+        for under_login in [false, true] {
+            let terminal = build_bash_terminal(cx, under_login).await;
+            terminal.update(cx, |terminal, _| {
+                terminal
+                    .report_working_directory(working_directory_report("localhost", "/reported"));
+                assert_eq!(
+                    terminal.working_directory(),
+                    reported,
+                    "under login: {under_login}"
+                );
+            });
+
+            type_into(&terminal, "sleep 30\n", cx);
+            wait_for_shell_in_foreground(&terminal, false, cx).await;
+            terminal.read_with(cx, |terminal, _| {
+                assert_eq!(
+                    terminal.current_working_directory_report(),
+                    None,
+                    "under login: {under_login}"
+                );
+            });
+
+            type_into(&terminal, "\x03", cx);
+            wait_for_shell_in_foreground(&terminal, true, cx).await;
+            terminal.read_with(cx, |terminal, _| {
+                assert_eq!(
+                    terminal.working_directory(),
+                    reported,
+                    "under login: {under_login}"
+                );
+            });
+        }
+    }
+
+    #[cfg(all(unix, feature = "ghostty"))]
+    #[gpui::test]
+    async fn test_running_status_clears_once_the_shell_is_back_in_the_foreground(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        for under_login in [false, true] {
+            let terminal = build_bash_terminal(cx, under_login).await;
+            type_into(&terminal, "sleep 30\n", cx);
+            wait_for_shell_in_foreground(&terminal, false, cx).await;
+            terminal.update(cx, |terminal, cx| {
+                terminal.process_event(
+                    TerminalBackendEvent::ProgramStatus(ProgramStatusReport {
+                        id: String::new(),
+                        state: ProgramState::Working,
+                        progress: None,
+                        app: "sleep".to_owned(),
+                        title: String::new(),
+                        message: String::new(),
+                    }),
+                    cx,
+                );
+                terminal.process_event(TerminalBackendEvent::Wakeup, cx);
+                assert!(terminal.has_running_status(), "under login: {under_login}");
+            });
+
+            type_into(&terminal, "\x03", cx);
+            wait_for_shell_in_foreground(&terminal, true, cx).await;
+            terminal.update(cx, |terminal, cx| {
+                terminal.process_event(TerminalBackendEvent::Wakeup, cx);
+                assert!(!terminal.has_running_status(), "under login: {under_login}");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_shell_working_directory_follows_the_shell(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        for under_login in [false, true] {
+            let terminal = build_bash_terminal(cx, under_login).await;
+            type_into(&terminal, "cd / && sleep 30\n", cx);
+            wait_for_shell_in_foreground(&terminal, false, cx).await;
+            terminal.read_with(cx, |terminal, _| {
+                let TerminalType::Pty { info, .. } = &terminal.terminal_type else {
+                    panic!("expected a PTY terminal");
+                };
+                assert!(info.load_for_test().is_some());
+                assert_eq!(
+                    terminal.shell_working_directory(),
+                    Some(PathBuf::from("/")),
+                    "under login: {under_login}"
+                );
+            });
+        }
     }
 
     #[test]
